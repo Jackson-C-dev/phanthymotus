@@ -74,4 +74,4 @@ plugins:
     url: ""          # API URL (empty = default endpoint)
     key: ""          # API Key
     model: ""        # model name
-    model_path: ""
+    model_path: "/models/obstacle"
