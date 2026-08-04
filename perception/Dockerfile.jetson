@@ -10,23 +10,20 @@
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-# Mainland-China default: install the aarch64 CPU wheel from PYPI_MIRROR.
-# Set ONNXRUNTIME_INSTALL_MODE=gpu and pass an internally mirrored Jetson
-# wheel URL to enable TensorRT/CUDA later. Generic PyPI onnxruntime-gpu
-# packages do not provide the required Jetson aarch64 build.
-ARG ONNXRUNTIME_INSTALL_MODE=cpu
-ARG ONNXRUNTIME_VERSION=1.15.1
-ARG ONNXRUNTIME_WHEEL_URL=
+# NVIDIA Jetson Zoo wheel for JetPack 5.x / CPython 3.8 / aarch64.
+# Do not replace this with the generic PyPI onnxruntime-gpu package: its
+# CUDA/TensorRT ABI may not match JetPack 5.1.1.
+# For builds in China, mirror this exact wheel to domestic object storage and
+# override ONNXRUNTIME_WHEEL_URL with --build-arg.  The URL remains an argument
+# because this Jetson-specific binary is not available from normal PyPI mirrors.
+ARG ONNXRUNTIME_WHEEL_URL=https://nvidia.box.com/shared/static/mvdcltm9ewdy2d5nurkiqorofz1s53ww.whl
 ARG ONNXRUNTIME_WHEEL_NAME=onnxruntime_gpu-1.15.1-cp38-cp38-linux_aarch64.whl
 ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
 FROM ${BASE_IMAGE}
 ARG PYPI_MIRROR
 ARG APT_MIRROR
-ARG ONNXRUNTIME_INSTALL_MODE
-ARG ONNXRUNTIME_VERSION
 ARG ONNXRUNTIME_WHEEL_URL
 ARG ONNXRUNTIME_WHEEL_NAME
-ENV OBSTACLE_ORT_INSTALL_MODE=${ONNXRUNTIME_INSTALL_MODE}
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -49,6 +46,8 @@ RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
+        libopenblas-base \
+        python3-pip \
         python3-opencv && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
@@ -89,7 +88,7 @@ RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     matplotlib pandas tqdm "pillow>=7.1.2" psutil py-cpuinfo \
     "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
-    pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
+    { pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null || true; }
 # ultralytics CLIP (GitHub via mirror, needed for set_classes)
 RUN pip3 install --no-cache-dir --no-deps "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git" && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} ftfy regex
@@ -105,33 +104,24 @@ ENV YOLO_CONFIG_DIR=/work
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
 # ── Obstacle distance model runtime ───────────────────────────────
-# obstacle_task_aligned.py directly imports cv2, numpy and onnxruntime.
-# ORT 1.15 supports ONNX opset <= 19; export the deployment model with
-# opset 19 (or lower).
+# obstacle.py uses cv2 and numpy plus either onnxruntime or the CUDA-enabled
+# torch already supplied by BASE_IMAGE.  Its model downloader uses the Python
+# standard-library bz2/tarfile/urllib modules.
+# ORT 1.15 supports ONNX opset <= 19, so export the Jetson deployment
+# model with opset 19 (or lower). ORT will reject the current opset-20
+# desktop model when it creates the inference session.
 RUN pip3 uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true
-RUN if [ "${ONNXRUNTIME_INSTALL_MODE}" = "cpu" ]; then \
-        pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-            "onnxruntime==${ONNXRUNTIME_VERSION}"; \
-    elif [ "${ONNXRUNTIME_INSTALL_MODE}" = "gpu" ]; then \
-        test -n "${ONNXRUNTIME_WHEEL_URL}" || { \
-            echo "ONNXRUNTIME_WHEEL_URL is required for gpu mode" >&2; \
-            exit 2; \
-        }; \
-        curl --fail --location --connect-timeout 15 --max-time 180 \
-            --retry 2 --retry-delay 5 --retry-connrefused \
-            "${ONNXRUNTIME_WHEEL_URL}" \
-            --output "/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
-        pip3 install --no-cache-dir "/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
-        rm -f "/tmp/${ONNXRUNTIME_WHEEL_NAME}"; \
-    else \
-        echo "ONNXRUNTIME_INSTALL_MODE must be cpu or gpu" >&2; \
-        exit 2; \
-    fi && \
+RUN curl --fail --location --retry 3 \
+        --retry-connrefused --retry-delay 2 --connect-timeout 15 \
+        "${ONNXRUNTIME_WHEEL_URL}" \
+        --output "/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+        "/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
+    rm -f "/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} --force-reinstall "numpy==1.24.4"
 
-# CPU mode requires CPUExecutionProvider. GPU mode additionally requires
-# the TensorRT and CUDA providers compiled into the Jetson-specific wheel.
-RUN python3 -c "import cv2, numpy, onnxruntime as ort; mode='${ONNXRUNTIME_INSTALL_MODE}'; p=set(ort.get_available_providers()); assert 'CPUExecutionProvider' in p, 'ORT CPU provider missing: %s' % sorted(p); assert mode != 'gpu' or {'TensorrtExecutionProvider', 'CUDAExecutionProvider'} <= p, 'Jetson GPU providers missing: %s' % sorted(p); print('mode', mode, 'OpenCV', cv2.__version__, 'NumPy', numpy.__version__, 'ORT', ort.__version__, 'providers', sorted(p))"
+# Fail the image build early if a CPU-only ORT wheel was installed by mistake.
+RUN python3 -c "import cv2, numpy, onnxruntime as ort; p=set(ort.get_available_providers()); assert {'TensorrtExecutionProvider', 'CUDAExecutionProvider'} <= p, 'Jetson GPU providers missing: %s' % sorted(p); print('OpenCV', cv2.__version__, 'NumPy', numpy.__version__, 'ORT', ort.__version__, 'providers', sorted(p))"
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
@@ -148,11 +138,12 @@ EXPOSE 15721
 RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.8/dist-packages/ros_ws.pth && \
     find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python3.8/dist-packages/ros_ws.pth
 
-# Validate the imports used by the obstacle ROS2 adapter after both ROS
-# workspaces have been added to Python's search path.
+# Validate the complete obstacle import surface after application code and both
+# ROS workspaces have been added to Python's search path.  Attribute checks also
+# cover the OpenCV operations used for image decoding and post-processing.
 RUN . /opt/ros/humble/install/setup.sh && \
     . /ros_ws/install/setup.sh && \
-    python3 -c "import rclpy; from sensor_msgs.msg import CompressedImage; from std_msgs.msg import String; print('obstacle ROS2 imports OK')"
+    PYTHONPATH=/work python3 -c "import bz2, tarfile, urllib.request; import cv2, numpy, onnxruntime, torch; import plugins.obstacle as obstacle; from sensor_msgs.msg import CompressedImage; from std_msgs.msg import String; from utils.model_downloader import ensure_model; assert obstacle._ROS2_AVAILABLE; assert all(hasattr(cv2, name) for name in ('imdecode', 'cvtColor', 'resize', 'connectedComponents')); print('obstacle dependencies OK:', 'OpenCV', cv2.__version__, 'NumPy', numpy.__version__, 'ORT', onnxruntime.__version__, 'Torch', torch.__version__)"
 
 # ROS2 shared libraries（audio_msgs .so 等）
 ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
@@ -162,6 +153,7 @@ CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
-     python3 -c \"import os, torch, onnxruntime as ort; mode=os.environ.get('OBSTACLE_ORT_INSTALL_MODE', 'cpu'); p=set(ort.get_available_providers()); assert 'CPUExecutionProvider' in p, 'ORT CPU provider missing: ' + str(sorted(p)); assert mode != 'gpu' or torch.cuda.is_available(), 'CUDA is unavailable; start the container with --runtime=nvidia'; assert mode != 'gpu' or {'TensorrtExecutionProvider', 'CUDAExecutionProvider'} <= p, 'Jetson GPU providers missing: ' + str(sorted(p))\" && \
+     python3 -c \"import torch, onnxruntime as ort; p=set(ort.get_available_providers()); assert torch.cuda.is_available(), 'CUDA is unavailable; start the container with --runtime=nvidia'; assert {'TensorrtExecutionProvider', 'CUDAExecutionProvider'} <= p, 'Jetson GPU providers missing: ' + str(sorted(p))\" && \
      python3 /work/main.py"]
+
 
