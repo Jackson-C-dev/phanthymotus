@@ -407,6 +407,10 @@ class TaskAlignedLocalDistanceAdapter(DistanceAdapter):
     """Lightweight metric-distance inference and benchmark-specific geometry."""
 
     def __init__(self, cfg: Mapping[str, Any]):
+        import os
+        from utils.model_downloader import ensure_model
+
+        ensure_model("obstacle", model_path)
         model_value = (
             cfg.get("model_path")
             or os.environ.get("OBSTACLE_MODEL_PATH")
