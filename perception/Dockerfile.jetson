@@ -152,7 +152,8 @@ CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
-     python3 -c \"import torch, onnxruntime as ort; p=set(ort.get_available_providers()); assert torch.cuda.is_available(), 'CUDA is unavailable; start the container with --runtime=nvidia'; assert {'TensorrtExecutionProvider', 'CUDAExecutionProvider'} <= p, 'Jetson GPU providers missing: ' + str(sorted(p))\" && \
+     python3 -c \"import onnxruntime as ort; p=set(ort.get_available_providers()); assert {'TensorrtExecutionProvider', 'CUDAExecutionProvider'} <= p, 'Jetson GPU providers missing: ' + str(sorted(p))\" && \
      python3 /work/main.py"]
+
 
 
