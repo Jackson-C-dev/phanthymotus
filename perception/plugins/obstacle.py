@@ -407,10 +407,8 @@ class TaskAlignedLocalDistanceAdapter(DistanceAdapter):
     """Lightweight metric-distance inference and benchmark-specific geometry."""
 
     def __init__(self, cfg: Mapping[str, Any]):
-        import os
-        from utils.model_downloader import ensure_model
+        from utils.model_downloader import MODELS, ensure_model
 
-        ensure_model("obstacle", model_path)
         model_value = (
             cfg.get("model_path")
             or os.environ.get("OBSTACLE_MODEL_PATH")
@@ -419,7 +417,14 @@ class TaskAlignedLocalDistanceAdapter(DistanceAdapter):
         if not model_value:
             raise ValueError("model_path (or OBSTACLE_MODEL_PATH) is required for local inference")
 
-        model_path = Path(str(model_value)).expanduser().resolve()
+        configured_path = Path(str(model_value)).expanduser().resolve()
+        if configured_path.suffix.lower() in {".onnx", ".pt", ".pth"}:
+            model_path = configured_path
+        else:
+            # A directory is accepted for deployment convenience.  This matches
+            # config.yaml and lets the domestic/internal model mirror populate it.
+            ensure_model("obstacle", str(configured_path))
+            model_path = configured_path / str(MODELS["obstacle"]["check_file"])
         if not model_path.is_file():
             raise FileNotFoundError(f"obstacle model not found: {model_path}")
         size_limit_mb = float(cfg.get("model_size_limit_mb", 30.0))
