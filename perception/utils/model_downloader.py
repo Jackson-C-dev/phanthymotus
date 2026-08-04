@@ -14,6 +14,7 @@ from urllib.request import urlretrieve
 log = logging.getLogger(__name__)
 
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
+JUICEFS_BASE = "http://172.28.4.81:34567/chenhanqing/obstacle"
 
 MODELS = {
     "asr": {
@@ -38,7 +39,10 @@ MODELS = {
         "check_file": "silero_vad.onnx",
         "single_file": True,  # Not an archive, just a single file download
     },
-}
+    "obstacle": {
+        "url": f"{JUICEFS_BASE}/obstacle-distance.tar.bz2",
+        "check_file": "yolo26n-depth.onnx",
+    },}
 
 
 def ensure_model(name: str, model_dir: str) -> None:
