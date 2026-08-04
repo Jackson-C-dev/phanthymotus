@@ -67,3 +67,11 @@ plugins:
     key: ""            # API Key
     model: ""          # model name (default: gpt-4o-mini / qwen-vl-max)
     language: "zh"     # default language hint
+
+  obstacle:
+    enabled: true
+    provider: local    # openai | qwen | local
+    url: ""          # API URL (empty = default endpoint)
+    key: ""          # API Key
+    model: ""        # model name
+    model_path: ""
