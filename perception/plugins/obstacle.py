@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 Drop-in ROS2 obstacle-distance plugin using a task-aligned local model.
@@ -174,6 +175,7 @@ TOOLS = [
                 },
                 "use_first_output_as_distance": {"type": "boolean", "scope": "shared"},
                 "gpu_memory_limit_mb": {"type": "integer", "scope": "shared"},
+                "trt_workspace_limit_mb": {"type": "integer", "scope": "shared"},
                 "use_dla": {"type": "boolean", "scope": "shared"},
                 "dla_core": {"type": "integer", "scope": "shared"},
                 "model_size_limit_mb": {"type": "number", "scope": "shared"},
@@ -250,6 +252,95 @@ def _find_output(outputs: Mapping[str, Any], aliases: tuple[str, ...]) -> Any:
     return None
 
 
+def _cuda_memory_snapshot(*, include_torch_allocator: bool = False) -> Optional[dict[str, float]]:
+    """Return a best-effort CUDA memory snapshot in MiB.
+
+    ONNX deployments query CUDA Runtime directly so memory diagnostics do not
+    import PyTorch into every container.  The values are device-wide, so callers
+    must treat the free-memory delta as an estimate when several containers
+    initialize concurrently.  Torch allocator counters are added only for an
+    actual TorchScript deployment.
+    """
+    try:
+        import ctypes
+
+        cuda_runtime = None
+        for library_name in ("libcudart.so", "libcudart.so.11.0", "libcudart.so.11"):
+            try:
+                cuda_runtime = ctypes.CDLL(library_name)
+                break
+            except OSError:
+                continue
+        if cuda_runtime is None:
+            raise RuntimeError("CUDA Runtime library (libcudart) was not found")
+
+        free_bytes = ctypes.c_size_t()
+        total_bytes = ctypes.c_size_t()
+        cuda_runtime.cudaMemGetInfo.argtypes = [
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        cuda_runtime.cudaMemGetInfo.restype = ctypes.c_int
+        status = cuda_runtime.cudaMemGetInfo(ctypes.byref(free_bytes), ctypes.byref(total_bytes))
+        if status != 0:
+            raise RuntimeError(f"cudaMemGetInfo failed with CUDA status {status}")
+        snapshot = {
+            "device_free_mb": float(free_bytes.value) / _MIB,
+            "device_total_mb": float(total_bytes.value) / _MIB,
+        }
+        if include_torch_allocator:
+            import torch
+
+            snapshot.update(
+                {
+                    "torch_allocated_mb": float(torch.cuda.memory_allocated()) / _MIB,
+                    "torch_reserved_mb": float(torch.cuda.memory_reserved()) / _MIB,
+                }
+            )
+        return snapshot
+    except Exception as exc:
+        log.warning("[obstacle][gpu] unable to query CUDA memory: %s", exc)
+        return None
+
+
+def _log_gpu_memory(
+    *,
+    runtime: str,
+    cfg: Mapping[str, Any],
+    before: Optional[Mapping[str, float]] = None,
+    after: Optional[Mapping[str, float]] = None,
+) -> None:
+    """Emit one parseable GPU-budget or post-warm-up record per container."""
+    cuda_limit_mb = int(cfg.get("gpu_memory_limit_mb", 384))
+    trt_workspace_mb = int(cfg.get("trt_workspace_limit_mb", 64)) if runtime == "onnx" else 0
+    record: dict[str, Any] = {
+        "container": os.environ.get("HOSTNAME", "unknown"),
+        "pid": os.getpid(),
+        "mcp_port": os.environ.get("MCP_PORT", "unknown"),
+        "runtime": runtime,
+        "cuda_ep_limit_mb": cuda_limit_mb,
+        "trt_workspace_limit_mb": trt_workspace_mb,
+        # Conservative peak budget: TensorRT engine-build workspace can coexist
+        # temporarily with the CUDA execution-provider arena.
+        "potential_peak_budget_mb": cuda_limit_mb + trt_workspace_mb,
+        "use_dla": _as_bool(cfg.get("use_dla"), False),
+    }
+    if before is None and after is None:
+        record["event"] = "configured_budget"
+    else:
+        record["event"] = "after_model_warmup"
+        if before:
+            record.update({f"before_{key}": round(value, 1) for key, value in before.items()})
+        if after:
+            record.update({f"after_{key}": round(value, 1) for key, value in after.items()})
+        if before and after:
+            record["device_free_delta_mb_estimate"] = round(
+                before["device_free_mb"] - after["device_free_mb"], 1
+            )
+            record["measurement_scope"] = "device-wide; concurrent containers affect delta"
+    log.info("[obstacle][gpu] %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
+
+
 class DistanceAdapter(ABC):
     """Interface retained from the sample plugin."""
 
@@ -283,7 +374,8 @@ class _OnnxRunner(_ModelRunner):
 
         available = set(ort.get_available_providers())
         providers: list[Any] = []
-        gpu_limit = int(cfg.get("gpu_memory_limit_mb", 4608)) * _MIB
+        gpu_limit = int(cfg.get("gpu_memory_limit_mb", 384)) * _MIB
+        trt_workspace_limit = int(cfg.get("trt_workspace_limit_mb", 64)) * _MIB
         cache_dir = str(cfg.get("engine_cache_path", "/tmp/obstacle_trt_cache"))
 
         if "TensorrtExecutionProvider" in available:
@@ -292,9 +384,9 @@ class _OnnxRunner(_ModelRunner):
                 "trt_fp16_enable": "1",
                 "trt_engine_cache_enable": "1",
                 "trt_engine_cache_path": cache_dir,
-                "trt_max_workspace_size": str(min(gpu_limit // 2, 2 * 1024**3)),
+                "trt_max_workspace_size": str(trt_workspace_limit),
             }
-            if _as_bool(cfg.get("use_dla"), True):
+            if _as_bool(cfg.get("use_dla"), False):
                 trt_options.update(
                     {
                         "trt_dla_enable": "1",
@@ -316,6 +408,7 @@ class _OnnxRunner(_ModelRunner):
                         "gpu_mem_limit": str(gpu_limit),
                         "arena_extend_strategy": "kSameAsRequested",
                         "cudnn_conv_algo_search": "HEURISTIC",
+                        "cudnn_conv_use_max_workspace": "0",
                         "do_copy_in_default_stream": "1",
                     },
                 )
@@ -375,7 +468,7 @@ class _TorchScriptRunner(_ModelRunner):
         )
         self._fp16 = self._device.type == "cuda" and _as_bool(cfg.get("fp16"), True)
         if self._device.type == "cuda":
-            gpu_limit = int(cfg.get("gpu_memory_limit_mb", 4608)) * _MIB
+            gpu_limit = int(cfg.get("gpu_memory_limit_mb", 384)) * _MIB
             try:
                 total_memory = int(torch.cuda.get_device_properties(self._device).total_memory)
                 fraction = min(0.95, max(0.05, gpu_limit / total_memory))
@@ -463,6 +556,8 @@ class TaskAlignedLocalDistanceAdapter(DistanceAdapter):
         runtime = str(cfg.get("runtime", "auto")).lower()
         if runtime == "auto":
             runtime = "onnx" if model_path.suffix.lower() == ".onnx" else "torchscript"
+        _log_gpu_memory(runtime=runtime, cfg=cfg)
+        gpu_memory_before = _cuda_memory_snapshot(include_torch_allocator=runtime == "torchscript")
         if runtime == "onnx":
             self._runner: _ModelRunner = _OnnxRunner(model_path, cfg)
         elif runtime == "torchscript":
@@ -471,6 +566,13 @@ class TaskAlignedLocalDistanceAdapter(DistanceAdapter):
             raise ValueError("runtime must be auto, onnx or torchscript")
 
         self._warmup()
+        gpu_memory_after = _cuda_memory_snapshot(include_torch_allocator=runtime == "torchscript")
+        _log_gpu_memory(
+            runtime=runtime,
+            cfg=cfg,
+            before=gpu_memory_before,
+            after=gpu_memory_after,
+        )
         log.info(
             "[obstacle] model=%s size=%.2fMiB input=%dx%d scene=%s",
             model_path,
