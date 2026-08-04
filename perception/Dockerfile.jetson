@@ -1,3 +1,4 @@
+
 # ── Jetson GPU variant ──────────────────────────────────────────────
 # Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
 #
@@ -111,13 +112,35 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 # model with opset 19 (or lower). ORT will reject the current opset-20
 # desktop model when it creates the inference session.
 RUN pip3 uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true
-RUN curl --fail --location --retry 3 \
-        --retry-connrefused --retry-delay 2 --connect-timeout 15 \
-        "${ONNXRUNTIME_WHEEL_URL}" \
-        --output "/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
+# Prefer a pre-downloaded wheel from the build context.  This keeps remote
+# builds deterministic when nvidia.box.com is slow or temporarily unreachable.
+COPY perception/vendor/ /opt/phanthy-motus/vendor/
+RUN wheel_path="/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
+    local_wheel="/opt/phanthy-motus/vendor/${ONNXRUNTIME_WHEEL_NAME}" && \
+    if [ -s "${local_wheel}" ]; then \
+        echo "Using vendored ONNX Runtime wheel: ${local_wheel}" && \
+        cp "${local_wheel}" "${wheel_path}"; \
+    else \
+        download_ok=0; \
+        for attempt in 1 2 3 4 5; do \
+            echo "Downloading ONNX Runtime wheel (attempt ${attempt}/5)"; \
+            if curl --fail --location --continue-at - \
+                    --connect-timeout 60 --max-time 300 \
+                    "${ONNXRUNTIME_WHEEL_URL}" \
+                    --output "${wheel_path}"; then \
+                download_ok=1; \
+                break; \
+            fi; \
+            sleep $((attempt * 5)); \
+        done; \
+        [ "${download_ok}" -eq 1 ] || { \
+            echo >&2 "Unable to download ${ONNXRUNTIME_WHEEL_NAME}. Put it in perception/vendor/ and rebuild."; \
+            exit 1; \
+        }; \
+    fi && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-        "/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
-    rm -f "/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
+        "${wheel_path}" && \
+    rm -f "${wheel_path}" && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} --force-reinstall "numpy==1.24.4"
 
 # Fail the image build early if a CPU-only ORT wheel was installed by mistake.
@@ -155,5 +178,4 @@ CMD ["/bin/bash", "-c", \
      source /ros_ws/install/setup.bash && \
      python3 -c \"import torch, onnxruntime as ort; p=set(ort.get_available_providers()); assert torch.cuda.is_available(), 'CUDA is unavailable; start the container with --runtime=nvidia'; assert {'TensorrtExecutionProvider', 'CUDAExecutionProvider'} <= p, 'Jetson GPU providers missing: ' + str(sorted(p))\" && \
      python3 /work/main.py"]
-
 
