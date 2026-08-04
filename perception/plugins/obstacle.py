@@ -431,14 +431,14 @@ class TaskAlignedLocalDistanceAdapter(DistanceAdapter):
 
         self._cfg = dict(cfg)
         self._input_width = int(cfg.get("input_width", 320))
-        self._input_height = int(cfg.get("input_height", 240))
+        self._input_height = int(cfg.get("input_height", 320))
         if self._input_width <= 0 or self._input_height <= 0:
             raise ValueError("input_width/input_height must be positive")
-        self._input_normalization = str(cfg.get("input_normalization", "imagenet")).lower()
+        self._input_normalization = str(cfg.get("input_normalization", "zero_one")).lower()
         if self._input_normalization not in {"imagenet", "zero_one"}:
             raise ValueError("input_normalization must be imagenet or zero_one")
         self._use_first_output_as_distance = _as_bool(
-            cfg.get("use_first_output_as_distance"), False
+            cfg.get("use_first_output_as_distance"), True
         )
         self._scene_mode = str(cfg.get("scene_mode", "auto")).lower()
         if self._scene_mode not in {"auto", "indoor", "outdoor"}:
