@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Drop-in ROS2 obstacle-distance plugin using a task-aligned local model.
@@ -381,15 +380,17 @@ class _OnnxRunner(_ModelRunner):
         if "TensorrtExecutionProvider" in available:
             Path(cache_dir).mkdir(parents=True, exist_ok=True)
             trt_options = {
-                "trt_fp16_enable": "1",
-                "trt_engine_cache_enable": "1",
+                # The Python provider API expects real bool values. Numeric
+                # strings such as "1" are rejected by ORT 1.16's TRT parser.
+                "trt_fp16_enable": True,
+                "trt_engine_cache_enable": True,
                 "trt_engine_cache_path": cache_dir,
                 "trt_max_workspace_size": str(trt_workspace_limit),
             }
             if _as_bool(cfg.get("use_dla"), False):
                 trt_options.update(
                     {
-                        "trt_dla_enable": "1",
+                        "trt_dla_enable": True,
                         "trt_dla_core": str(int(cfg.get("dla_core", 0))),
                     }
                 )
@@ -1053,3 +1054,4 @@ class ObstacleDistancePlugin:
             return {"status": "configured", "config": cfg}
 
         return None
+
