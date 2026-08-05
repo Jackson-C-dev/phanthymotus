@@ -1,4 +1,3 @@
-
 # ── Jetson GPU variant ──────────────────────────────────────────────
 # Target: JetPack 6.2 / L4T R36.4.x / Ubuntu 22.04 / Python 3.10
 #         CUDA 12.6 / TensorRT 10.3
@@ -12,14 +11,13 @@
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-# JetPack 6.x / CPython 3.10 / aarch64 GPU wheel. Keep both URLs on
-# China-accessible download accelerators: the build host must not connect to
-# GitHub or objects.githubusercontent.com directly.
+# JetPack 6.x / CPython 3.10 / aarch64 GPU wheel. Prefer the internal JuiceFS
+# file service so repeated image builds do not depend on GitHub connectivity.
 # Generic PyPI mirrors only provide x86_64 onnxruntime-gpu wheels for this
 # version range and cannot be used on Jetson.
-ARG ONNXRUNTIME_WHEEL_URL=https://gh-proxy.com/https://github.com/ultralytics/assets/releases/download/v0.0.0/onnxruntime_gpu-1.20.0-cp310-cp310-linux_aarch64.whl
-ARG ONNXRUNTIME_WHEEL_FALLBACK_URL=https://gh.chjina.com/https://github.com/ultralytics/assets/releases/download/v0.0.0/onnxruntime_gpu-1.20.0-cp310-cp310-linux_aarch64.whl
 ARG ONNXRUNTIME_WHEEL_NAME=onnxruntime_gpu-1.20.0-cp310-cp310-linux_aarch64.whl
+ARG ONNXRUNTIME_WHEEL_URL=http://172.28.4.81:34567/chenhanqing/obstacle/onnxruntime_gpu-1.20.0-cp310-cp310-linux_aarch64.whl
+ARG ONNXRUNTIME_WHEEL_FALLBACK_URL=https://gh-proxy.com/https://github.com/ultralytics/assets/releases/download/v0.0.0/onnxruntime_gpu-1.20.0-cp310-cp310-linux_aarch64.whl
 ARG INSTALL_VOP_DEPS=0
 ARG JETSON_PYPI=https://pypi.jetson-ai-lab.io/jp6/cu126
 # DaoCloud mirrors the ARM64 dustynv ROS image and avoids Docker Hub access
@@ -63,6 +61,7 @@ RUN rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
         libglib2.0-0 \
         libgomp1 \
         libopenblas0 \
+        wget \
         python3-pip \
         python3-opencv && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
@@ -128,9 +127,10 @@ RUN wheel_path="/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
     downloaded=0 && \
     for wheel_url in "${ONNXRUNTIME_WHEEL_URL}" "${ONNXRUNTIME_WHEEL_FALLBACK_URL}"; do \
         echo "Downloading ONNX Runtime wheel from ${wheel_url}"; \
-        if curl --fail --location --retry 5 --retry-connrefused --retry-delay 3 \
-            --connect-timeout 30 --max-time 600 \
-            "${wheel_url}" --output "${wheel_path}"; then \
+        rm -f "${wheel_path}"; \
+        if wget --no-verbose --tries=5 --timeout=30 --read-timeout=120 \
+            --retry-connrefused --output-document="${wheel_path}" "${wheel_url}" && \
+            python3 -c "import sys, zipfile; assert zipfile.is_zipfile(sys.argv[1]), 'download is not a valid wheel'" "${wheel_path}"; then \
             downloaded=1; \
             break; \
         fi; \
@@ -186,7 +186,3 @@ CMD ["/bin/bash", "-c", \
      python3 -c \"import ctypes; c=ctypes.CDLL('libcudart.so'); n=ctypes.c_int(); s=c.cudaGetDeviceCount(ctypes.byref(n)); assert s == 0 and n.value > 0, 'CUDA runtime unavailable: status=%s devices=%s (start with --runtime=nvidia)' % (s, n.value); print('CUDA devices', n.value)\" && \
      python3 -c \"import onnxruntime as ort; p=set(ort.get_available_providers()); assert {'TensorrtExecutionProvider', 'CUDAExecutionProvider'} <= p, 'Jetson GPU providers missing: ' + str(sorted(p))\" && \
      python3 /work/main.py"]
-
-
-
-
