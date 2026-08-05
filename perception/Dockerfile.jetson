@@ -10,17 +10,20 @@
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-# JetPack 5.x / CPython 3.8 / aarch64 GPU wheel, downloaded through the same
-# China-accessible GitHub accelerator used by the CLIP dependency below.
+# JetPack 5.x / CPython 3.8 / aarch64 GPU wheel.  Keep both URLs on
+# China-accessible download accelerators: the build host must not connect to
+# GitHub or objects.githubusercontent.com directly.
 # Generic PyPI mirrors only provide x86_64 onnxruntime-gpu wheels for this
 # version range and cannot be used on Jetson.
-ARG ONNXRUNTIME_WHEEL_URL=https://ghfast.top/https://github.com/ykawa2/onnxruntime-gpu-for-jetson/releases/download/v1.16.3_r35.1.0-py3/onnxruntime_gpu-1.16.3-cp38-cp38-linux_aarch64.whl
+ARG ONNXRUNTIME_WHEEL_URL=https://gh-proxy.com/https://github.com/ykawa2/onnxruntime-gpu-for-jetson/releases/download/v1.16.3_r35.1.0-py3/onnxruntime_gpu-1.16.3-cp38-cp38-linux_aarch64.whl
+ARG ONNXRUNTIME_WHEEL_FALLBACK_URL=https://gh.chjina.com/https://github.com/ykawa2/onnxruntime-gpu-for-jetson/releases/download/v1.16.3_r35.1.0-py3/onnxruntime_gpu-1.16.3-cp38-cp38-linux_aarch64.whl
 ARG ONNXRUNTIME_WHEEL_NAME=onnxruntime_gpu-1.16.3-cp38-cp38-linux_aarch64.whl
 ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
 FROM ${BASE_IMAGE}
 ARG PYPI_MIRROR
 ARG APT_MIRROR
 ARG ONNXRUNTIME_WHEEL_URL
+ARG ONNXRUNTIME_WHEEL_FALLBACK_URL
 ARG ONNXRUNTIME_WHEEL_NAME
 
 # ── APT mirror (conditional) ─────────────────────────────────────
@@ -110,10 +113,18 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 # desktop model when it creates the inference session.
 RUN pip3 uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true
 RUN wheel_path="/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
-    curl --fail --location --retry 5 --retry-connrefused --retry-delay 3 \
-        --connect-timeout 30 --max-time 600 \
-        "${ONNXRUNTIME_WHEEL_URL}" \
-        --output "${wheel_path}" && \
+    downloaded=0 && \
+    for wheel_url in "${ONNXRUNTIME_WHEEL_URL}" "${ONNXRUNTIME_WHEEL_FALLBACK_URL}"; do \
+        echo "Downloading ONNX Runtime wheel from ${wheel_url}"; \
+        if curl --fail --location --retry 5 --retry-connrefused --retry-delay 3 \
+            --connect-timeout 30 --max-time 600 \
+            "${wheel_url}" --output "${wheel_path}"; then \
+            downloaded=1; \
+            break; \
+        fi; \
+        rm -f "${wheel_path}"; \
+    done && \
+    [ "${downloaded}" = 1 ] && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
         "${wheel_path}" && \
     rm -f "${wheel_path}" && \
@@ -154,6 +165,7 @@ CMD ["/bin/bash", "-c", \
      source /ros_ws/install/setup.bash && \
      python3 -c \"import onnxruntime as ort; p=set(ort.get_available_providers()); assert {'TensorrtExecutionProvider', 'CUDAExecutionProvider'} <= p, 'Jetson GPU providers missing: ' + str(sorted(p))\" && \
      python3 /work/main.py"]
+
 
 
 
