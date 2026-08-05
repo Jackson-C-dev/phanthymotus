@@ -75,6 +75,6 @@ plugins:
     key: ""          # API Key
     model: ""        # model name
     model_path: "/models/obstacle"
-    gpu_memory_limit_mb: 384
+    gpu_memory_limit_mb: 464
     trt_workspace_limit_mb: 64
     use_dla: false
