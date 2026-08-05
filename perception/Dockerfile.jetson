@@ -1,8 +1,9 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
-# Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
+# Target: JetPack 6.2 / L4T R36.4.x / Ubuntu 22.04 / Python 3.10
+#         CUDA 12.6 / TensorRT 10.3
 #
 # Build context: repo root (phanthy-motus/) so we can access both
-# src/perception_stack/ and deploy/ros-base/audio_msgs/
+# perception/ and deploy/ros-base/audio_msgs/
 #
 # Usage:
 #   ./deploy/build_perception.sh --variant jetson --mirror tuna
@@ -10,44 +11,57 @@
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-# JetPack 5.x / CPython 3.8 / aarch64 GPU wheel.  Keep both URLs on
+# JetPack 6.x / CPython 3.10 / aarch64 GPU wheel. Keep both URLs on
 # China-accessible download accelerators: the build host must not connect to
 # GitHub or objects.githubusercontent.com directly.
 # Generic PyPI mirrors only provide x86_64 onnxruntime-gpu wheels for this
 # version range and cannot be used on Jetson.
-ARG ONNXRUNTIME_WHEEL_URL=https://gh-proxy.com/https://github.com/ykawa2/onnxruntime-gpu-for-jetson/releases/download/v1.16.3_r35.1.0-py3/onnxruntime_gpu-1.16.3-cp38-cp38-linux_aarch64.whl
-ARG ONNXRUNTIME_WHEEL_FALLBACK_URL=https://gh.chjina.com/https://github.com/ykawa2/onnxruntime-gpu-for-jetson/releases/download/v1.16.3_r35.1.0-py3/onnxruntime_gpu-1.16.3-cp38-cp38-linux_aarch64.whl
-ARG ONNXRUNTIME_WHEEL_NAME=onnxruntime_gpu-1.16.3-cp38-cp38-linux_aarch64.whl
-ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
+ARG ONNXRUNTIME_WHEEL_URL=https://gh-proxy.com/https://github.com/ultralytics/assets/releases/download/v0.0.0/onnxruntime_gpu-1.20.0-cp310-cp310-linux_aarch64.whl
+ARG ONNXRUNTIME_WHEEL_FALLBACK_URL=https://gh.chjina.com/https://github.com/ultralytics/assets/releases/download/v0.0.0/onnxruntime_gpu-1.20.0-cp310-cp310-linux_aarch64.whl
+ARG ONNXRUNTIME_WHEEL_NAME=onnxruntime_gpu-1.20.0-cp310-cp310-linux_aarch64.whl
+ARG INSTALL_VOP_DEPS=0
+ARG JETSON_PYPI=https://pypi.jetson-ai-lab.io/jp6/cu126
+# DaoCloud mirrors the ARM64 dustynv ROS image and avoids Docker Hub access
+# from the domestic build environment. R36.4.0 user space is compatible with
+# the JetPack 6.2 / R36.4.3 host driver stack.
+ARG BASE_IMAGE=docker.m.daocloud.io/dustynv/ros:humble-desktop-l4t-r36.4.0
 FROM ${BASE_IMAGE}
 ARG PYPI_MIRROR
 ARG APT_MIRROR
 ARG ONNXRUNTIME_WHEEL_URL
 ARG ONNXRUNTIME_WHEEL_FALLBACK_URL
 ARG ONNXRUNTIME_WHEEL_NAME
+ARG INSTALL_VOP_DEPS
+ARG JETSON_PYPI
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
-        sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g; s/ports.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list; \
+        if [ -f /etc/apt/sources.list ]; then \
+            sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g; s/ports.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list; \
+        fi; \
     fi
 
 # ── Switch ROS2 to TUNA mirror + skip expired key (if sources exist) ──
-RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
-        sed -i 's|http://packages.ros.org/ros2/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu|g' /etc/apt/sources.list.d/*.list && \
-        sed -i 's|deb \[|deb [trusted=yes |g; s|deb http|deb [trusted=yes] http|g' /etc/apt/sources.list.d/ros2*.list; \
-    fi
+RUN for source_file in /etc/apt/sources.list.d/*.list; do \
+        [ -f "${source_file}" ] || continue; \
+        sed -i 's|http://packages.ros.org/ros2/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu|g' "${source_file}"; \
+        if grep -q 'ros2/ubuntu' "${source_file}"; then \
+            sed -i 's|deb \[|deb [trusted=yes |g; s|deb http|deb [trusted=yes] http|g' "${source_file}"; \
+        fi; \
+    done
 
 # ── System deps ────────────────────────────────────────────────────
-RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
+RUN rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         ca-certificates \
         curl \
         ffmpeg \
+        git \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
-        libopenblas-base \
+        libopenblas0 \
         python3-pip \
         python3-opencv && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
@@ -62,9 +76,8 @@ RUN cd /ros_ws && \
     colcon build --packages-select audio_msgs --cmake-args -DCMAKE_BUILD_TYPE=Release
 
 # ── Python deps ────────────────────────────────────────────────────
-# NumPy 2.x is not ABI-compatible with the JetPack 5 system OpenCV and
-# the Python 3.8-era ONNX Runtime wheel used below.
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "numpy==1.24.4"
+# Keep NumPy on the 1.x ABI used by the JP6 system OpenCV and this ORT wheel.
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "numpy==1.26.4"
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml requests websockets webrtcvad websocket-client dashscope && \
@@ -74,29 +87,28 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     kiss-icp scipy
 
-# ── VOP deps (YOLOv8-World object detection) ─────────────────────
-# Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson)
-RUN python3 -c "import cv2" 2>/dev/null || { \
-    echo 'import importlib.util, sys, os' > /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo '_so = os.path.join(os.path.dirname(__file__), "python-3.8", "cv2.cpython-38-aarch64-linux-gnu.so")' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo '_spec = importlib.util.spec_from_file_location("cv2", _so)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo '_mod = importlib.util.module_from_spec(_spec)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo '_spec.loader.exec_module(_mod)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo 'sys.modules["cv2"] = _mod' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py; \
-    }
-# Install ultralytics WITHOUT replacing Jetson's CUDA torch + torchvision
-RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    matplotlib pandas tqdm "pillow>=7.1.2" psutil py-cpuinfo \
-    "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
-    { pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null || true; }
-# ultralytics CLIP (GitHub via mirror, needed for set_classes)
-RUN pip3 install --no-cache-dir --no-deps "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git" && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} ftfy regex
-
-# Pre-download CLIP weights into image (avoids 338MB download at runtime)
-RUN mkdir -p /work/weights/clip && \
-    python3 -c "import urllib.request; urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/ViT-B-32.pt', '/work/weights/clip/ViT-B-32.pt')"
+# ── Optional VOP deps (YOLOv8-World object detection) ─────────────
+# The JP5-only cv2 CPython 3.8 shim has deliberately been removed. Ubuntu
+# 22.04's python3-opencv provides the correct CPython 3.10 extension.
+# VOP is disabled in config.yaml, so the default obstacle image does not carry
+# PyTorch/CLIP or their large weights. Set --build-arg INSTALL_VOP_DEPS=1 when
+# VOP is required; its torch wheels come from the JP6/CUDA 12.6 Jetson index,
+# never from generic PyPI.
+RUN python3 -c "import cv2; print('system OpenCV', cv2.__version__)"
+RUN if [ "${INSTALL_VOP_DEPS}" = "1" ]; then \
+        pip3 install --no-cache-dir --index-url ${JETSON_PYPI} \
+            --extra-index-url ${PYPI_MIRROR} \
+            "torch==2.8.0" "torchvision==0.23.0" && \
+        pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
+        pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+            matplotlib pandas tqdm "pillow>=7.1.2" psutil py-cpuinfo \
+            "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" ftfy regex && \
+        pip3 install --no-cache-dir --no-deps \
+            "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git" && \
+        { pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null || true; } && \
+        mkdir -p /work/weights/clip && \
+        python3 -c "import urllib.request; urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/ViT-B-32.pt', '/work/weights/clip/ViT-B-32.pt')"; \
+    fi
 
 # Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
 ENV YOLO_CONFIG_DIR=/work
@@ -105,12 +117,11 @@ ENV YOLO_CONFIG_DIR=/work
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
 # ── Obstacle distance model runtime ───────────────────────────────
-# obstacle.py uses cv2 and numpy plus either onnxruntime or the CUDA-enabled
-# torch already supplied by BASE_IMAGE.  Its model downloader uses the Python
-# standard-library bz2/tarfile/urllib modules.
-# ORT 1.16 supports ONNX opset <= 19, so export the Jetson deployment
-# model with opset 19 (or lower). ORT will reject the current opset-20
-# desktop model when it creates the inference session.
+# The configured obstacle deployment uses cv2, numpy and ONNX Runtime. Its
+# model downloader uses the Python standard-library bz2/tarfile/urllib modules.
+# TorchScript models require INSTALL_VOP_DEPS=1.
+# ORT 1.20 is used here because the deployment model uses ONNX opset 20 and
+# the runtime must link against the JP6 CUDA 12.6 / TensorRT 10.x stack.
 RUN pip3 uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true
 RUN wheel_path="/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
     downloaded=0 && \
@@ -125,12 +136,13 @@ RUN wheel_path="/tmp/${ONNXRUNTIME_WHEEL_NAME}" && \
         rm -f "${wheel_path}"; \
     done && \
     [ "${downloaded}" = 1 ] && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-        "${wheel_path}" && \
+    pip3 install --no-cache-dir --no-deps "${wheel_path}" && \
     rm -f "${wheel_path}" && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} --force-reinstall "numpy==1.24.4"
+    pip3 install --no-cache-dir -i ${PYPI_MIRROR} --force-reinstall "numpy==1.26.4"
 
 # Fail the image build early if a CPU-only ORT wheel was installed by mistake.
+# Actual CUDA initialization is checked by CMD because docker build does not
+# run with the Jetson NVIDIA runtime or host driver mounts.
 RUN python3 -c "import cv2, numpy, onnxruntime as ort; p=set(ort.get_available_providers()); assert {'TensorrtExecutionProvider', 'CUDAExecutionProvider'} <= p, 'Jetson GPU providers missing: %s' % sorted(p); print('OpenCV', cv2.__version__, 'NumPy', numpy.__version__, 'ORT', ort.__version__, 'providers', sorted(p))"
 
 # ── Application code ───────────────────────────────────────────────
@@ -144,27 +156,32 @@ COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastd
 EXPOSE 15720
 EXPOSE 15721
 
-# 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
-RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.8/dist-packages/ros_ws.pth && \
-    find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python3.8/dist-packages/ros_ws.pth
+# 确保 ROS2 Python 包始终在当前 Python 的 site-packages 中（不写死 3.8/3.10）
+RUN pth_file="$(python3 -c 'import site; print(site.getsitepackages()[0] + "/ros_ws.pth")')" && \
+    find /ros_ws/install -name "site-packages" -type d > "${pth_file}" && \
+    find /opt/ros/humble/install -name "site-packages" -type d >> "${pth_file}"
 
 # Validate the complete obstacle import surface after application code and both
 # ROS workspaces have been added to Python's search path.  Attribute checks also
 # cover the OpenCV operations used for image decoding and post-processing.
 RUN . /opt/ros/humble/install/setup.sh && \
     . /ros_ws/install/setup.sh && \
-    PYTHONPATH=/work python3 -c "import bz2, tarfile, urllib.request; import cv2, numpy, onnxruntime, torch; import plugins.obstacle as obstacle; from sensor_msgs.msg import CompressedImage; from std_msgs.msg import String; from utils.model_downloader import ensure_model; assert obstacle._ROS2_AVAILABLE; assert all(hasattr(cv2, name) for name in ('imdecode', 'cvtColor', 'resize', 'connectedComponents')); print('obstacle dependencies OK:', 'OpenCV', cv2.__version__, 'NumPy', numpy.__version__, 'ORT', onnxruntime.__version__, 'Torch', torch.__version__)"
+    PYTHONPATH=/work python3 -c "import bz2, tarfile, urllib.request; import cv2, numpy, onnxruntime; import plugins.obstacle as obstacle; from sensor_msgs.msg import CompressedImage; from std_msgs.msg import String; from utils.model_downloader import ensure_model; assert obstacle._ROS2_AVAILABLE; assert all(hasattr(cv2, name) for name in ('imdecode', 'cvtColor', 'resize', 'connectedComponents')); print('obstacle dependencies OK:', 'OpenCV', cv2.__version__, 'NumPy', numpy.__version__, 'ORT', onnxruntime.__version__)"
 
-# ROS2 shared libraries（audio_msgs .so 等）
-ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+# ROS2 and JetPack 6 host-mounted CUDA/TensorRT shared libraries.
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu/nvidia:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
      source /opt/ros/humble/install/setup.bash && \
      source /ros_ws/install/setup.bash && \
+     python3 -c \"import ctypes; c=ctypes.CDLL('libcudart.so'); n=ctypes.c_int(); s=c.cudaGetDeviceCount(ctypes.byref(n)); assert s == 0 and n.value > 0, 'CUDA runtime unavailable: status=%s devices=%s (start with --runtime=nvidia)' % (s, n.value); print('CUDA devices', n.value)\" && \
      python3 -c \"import onnxruntime as ort; p=set(ort.get_available_providers()); assert {'TensorrtExecutionProvider', 'CUDAExecutionProvider'} <= p, 'Jetson GPU providers missing: ' + str(sorted(p))\" && \
      python3 /work/main.py"]
+
 
 
 
