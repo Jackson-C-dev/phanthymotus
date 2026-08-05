@@ -1,3 +1,4 @@
+
 # ── Jetson GPU variant ──────────────────────────────────────────────
 # Target: JetPack 6.2 / L4T R36.4.x / Ubuntu 22.04 / Python 3.10
 #         CUDA 12.6 / TensorRT 10.3
@@ -156,17 +157,21 @@ COPY perception/config/fastdds_large_message.xml /opt/phanthy-motus/config/fastd
 EXPOSE 15720
 EXPOSE 15721
 
-# 确保 ROS2 Python 包始终在当前 Python 的 site-packages 中（不写死 3.8/3.10）
+# 确保 ROS2 Python 包始终在当前 Python 的搜索路径中（不写死 3.8/3.10）。
+# Dusty-NV 的源码式 ROS 安装主要使用 dist-packages，而 colcon 工作区可能
+# 使用 site-packages；两者都必须写入 .pth。
 RUN pth_file="$(python3 -c 'import site; print(site.getsitepackages()[0] + "/ros_ws.pth")')" && \
-    find /ros_ws/install -name "site-packages" -type d > "${pth_file}" && \
-    find /opt/ros/humble/install -name "site-packages" -type d >> "${pth_file}"
+    find /ros_ws/install /opt/ros/humble/install -type d \
+        \( -name "site-packages" -o -name "dist-packages" \) \
+        -print | sort -u > "${pth_file}" && \
+    echo "ROS Python paths:" && cat "${pth_file}"
 
 # Validate the complete obstacle import surface after application code and both
 # ROS workspaces have been added to Python's search path.  Attribute checks also
 # cover the OpenCV operations used for image decoding and post-processing.
 RUN . /opt/ros/humble/install/setup.sh && \
     . /ros_ws/install/setup.sh && \
-    PYTHONPATH=/work python3 -c "import bz2, tarfile, urllib.request; import cv2, numpy, onnxruntime; import plugins.obstacle as obstacle; from sensor_msgs.msg import CompressedImage; from std_msgs.msg import String; from utils.model_downloader import ensure_model; assert obstacle._ROS2_AVAILABLE; assert all(hasattr(cv2, name) for name in ('imdecode', 'cvtColor', 'resize', 'connectedComponents')); print('obstacle dependencies OK:', 'OpenCV', cv2.__version__, 'NumPy', numpy.__version__, 'ORT', onnxruntime.__version__)"
+    PYTHONPATH="/work:${PYTHONPATH:-}" python3 -c "import bz2, tarfile, urllib.request; import cv2, numpy, onnxruntime; import plugins.obstacle as obstacle; from sensor_msgs.msg import CompressedImage; from std_msgs.msg import String; from utils.model_downloader import ensure_model; assert obstacle._ROS2_AVAILABLE; assert all(hasattr(cv2, name) for name in ('imdecode', 'cvtColor', 'resize', 'connectedComponents')); print('obstacle dependencies OK:', 'OpenCV', cv2.__version__, 'NumPy', numpy.__version__, 'ORT', onnxruntime.__version__)"
 
 # ROS2 and JetPack 6 host-mounted CUDA/TensorRT shared libraries.
 ENV NVIDIA_VISIBLE_DEVICES=all
@@ -181,7 +186,6 @@ CMD ["/bin/bash", "-c", \
      python3 -c \"import ctypes; c=ctypes.CDLL('libcudart.so'); n=ctypes.c_int(); s=c.cudaGetDeviceCount(ctypes.byref(n)); assert s == 0 and n.value > 0, 'CUDA runtime unavailable: status=%s devices=%s (start with --runtime=nvidia)' % (s, n.value); print('CUDA devices', n.value)\" && \
      python3 -c \"import onnxruntime as ort; p=set(ort.get_available_providers()); assert {'TensorrtExecutionProvider', 'CUDAExecutionProvider'} <= p, 'Jetson GPU providers missing: ' + str(sorted(p))\" && \
      python3 /work/main.py"]
-
 
 
 
