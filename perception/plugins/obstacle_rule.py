@@ -103,6 +103,9 @@ TOOLS = [
                 "no_obstacle_distance": {"type": "number", "scope": "instance"},
                 "near_distance_m": {"type": "number", "scope": "instance"},
                 "far_distance_m": {"type": "number", "scope": "instance"},
+                "decision_distance_m": {"type": "number", "scope": "instance"},
+                "positive_score_threshold": {"type": "number", "scope": "instance"},
+                "boundary_margin_m": {"type": "number", "scope": "instance"},
                 "processing_width": {"type": "integer", "scope": "shared"},
                 "processing_height": {"type": "integer", "scope": "shared"},
                 "center_width_ratio": {"type": "number", "scope": "instance"},
@@ -140,10 +143,32 @@ class RuleBasedDistanceAdapter:
         if self._fixed_distance is not None and self._fixed_distance < 0.0:
             raise ValueError("fixed_distance_m must be non-negative or null")
 
-        self.fallback_distance = max(0.0, float(cfg.get("no_obstacle_distance", 10.0)))
+        self._decision_distance = max(
+            0.05, float(cfg.get("decision_distance_m", 1.0))
+        )
+        self.fallback_distance = max(
+            self._decision_distance,
+            float(cfg.get("no_obstacle_distance", 10.0)),
+        )
         self._near_distance = max(0.05, float(cfg.get("near_distance_m", 0.5)))
         self._far_distance = max(
             self._near_distance, float(cfg.get("far_distance_m", 5.0))
+        )
+        if self._near_distance >= self._decision_distance:
+            raise ValueError("near_distance_m must be less than decision_distance_m")
+        if self._far_distance <= self._decision_distance:
+            raise ValueError("far_distance_m must be greater than decision_distance_m")
+        self._positive_score_threshold = _clamp(
+            float(cfg.get("positive_score_threshold", 0.62)), 0.05, 0.95
+        )
+        max_margin = min(
+            self._decision_distance - self._near_distance,
+            self._far_distance - self._decision_distance,
+        )
+        self._boundary_margin = _clamp(
+            float(cfg.get("boundary_margin_m", 0.02)),
+            0.001,
+            max_margin,
         )
         self._width = int(_clamp(float(cfg.get("processing_width", 320)), 64, 1920))
         self._height = int(_clamp(float(cfg.get("processing_height", 240)), 64, 1080))
@@ -163,12 +188,20 @@ class RuleBasedDistanceAdapter:
             _clamp(float(cfg.get("contrast_threshold", 18)), 1, 255)
         )
         self._score_threshold = _clamp(float(cfg.get("score_threshold", 0.18)), 0.0, 1.0)
+        if self._score_threshold >= self._positive_score_threshold:
+            raise ValueError(
+                "score_threshold must be less than positive_score_threshold"
+            )
         self.mode = "fixed" if self._fixed_distance is not None else "heuristic"
 
         log.info(
-            "[obstacle-rule] initialized: mode=%s fixed_distance_m=%s model_loaded=false gpu_memory_mb=0",
+            "[obstacle-rule] initialized: mode=%s fixed_distance_m=%s "
+            "decision_distance_m=%.3f positive_score_threshold=%.3f "
+            "model_loaded=false gpu_memory_mb=0",
             self.mode,
             self._fixed_distance,
+            self._decision_distance,
+            self._positive_score_threshold,
         )
 
     @staticmethod
@@ -182,6 +215,26 @@ class RuleBasedDistanceAdapter:
         if frame is None or frame.size == 0:
             raise ValueError("unable to decode compressed image")
         return frame
+
+    def _score_to_distance(self, score: float) -> float:
+        """Map evidence around the metric's explicit positive boundary.
+
+        Scores at or above ``positive_score_threshold`` always produce a value
+        strictly below the F1 decision distance; lower scores always produce a
+        value strictly above it.  This prevents near/far endpoint changes from
+        silently shifting the classifier's operating point.
+        """
+
+        score = _clamp(float(score), 0.0, 1.0)
+        threshold = self._positive_score_threshold
+        if score >= threshold:
+            strength = (score - threshold) / max(1e-9, 1.0 - threshold)
+            boundary = self._decision_distance - self._boundary_margin
+            return boundary - strength * (boundary - self._near_distance)
+
+        strength = (threshold - score) / max(1e-9, threshold)
+        boundary = self._decision_distance + self._boundary_margin
+        return boundary + strength * (self._far_distance - boundary)
 
     def _heuristic_distance(self, frame: Any) -> tuple[float, float, int]:
         import cv2
@@ -238,16 +291,9 @@ class RuleBasedDistanceAdapter:
         if best_score < self._score_threshold:
             return self.fallback_distance, 0.0, candidates
 
-        closeness = _clamp(best_score, 0.0, 1.0)
-        if self._far_distance == self._near_distance:
-            distance = self._near_distance
-        else:
-            # Log interpolation gives more resolution in the safety-critical near range.
-            distance = math.exp(
-                math.log(self._far_distance)
-                + closeness * (math.log(self._near_distance) - math.log(self._far_distance))
-            )
-        return float(distance), closeness, candidates
+        risk_score = _clamp(best_score, 0.0, 1.0)
+        distance = self._score_to_distance(risk_score)
+        return float(distance), risk_score, candidates
 
     def estimate(self, image_bytes: bytes) -> dict:
         started = time.perf_counter()
@@ -282,6 +328,9 @@ class _ObstacleRuleNode(Node):
         self._failure_count = 0
         self._dropped_count = 0
         self._last_latency_ms = 0.0
+        self._last_risk_score = 0.0
+        self._positive_count = 0
+        self._negative_count = 0
         self.state = "idle"
 
     def start(self) -> dict:
@@ -338,6 +387,7 @@ class _ObstacleRuleNode(Node):
             try:
                 result = self._adapter.estimate(image_bytes)
                 self._last_latency_ms = float(result.get("latency_ms", 0.0))
+                self._last_risk_score = float(result.get("confidence", 0.0))
             except Exception as exc:
                 self._failure_count += 1
                 log.error("[obstacle-rule] processing error: %s", exc, exc_info=True)
@@ -350,6 +400,10 @@ class _ObstacleRuleNode(Node):
         if not math.isfinite(distance):
             self._failure_count += 1
             distance = self._adapter.fallback_distance
+        if distance < self._adapter._decision_distance:
+            self._positive_count += 1
+        else:
+            self._negative_count += 1
         msg = String()
         msg.data = json.dumps({"pred_distance": distance}, ensure_ascii=False)
         self._pub.publish(msg)
@@ -391,6 +445,13 @@ class ObstacleRuleDistancePlugin:
                     "failure_count": node._failure_count,
                     "dropped_count": node._dropped_count,
                     "last_latency_ms": node._last_latency_ms,
+                    "last_risk_score": node._last_risk_score,
+                    "positive_count": node._positive_count,
+                    "negative_count": node._negative_count,
+                    "positive_rate": (
+                        node._positive_count
+                        / max(1, node._positive_count + node._negative_count)
+                    ),
                 }
                 for key, node in self._nodes.items()
             }
@@ -408,6 +469,8 @@ class ObstacleRuleDistancePlugin:
                 "model": "rule-based-dry-run",
                 "state": "running" if instances else "idle",
                 "instances": instances,
+                "decision_distance_m": self._adapter._decision_distance,
+                "positive_score_threshold": self._adapter._positive_score_threshold,
                 "topic_in": ([{"topic": input_topic, "format": "image/jpeg"}] if input_topic else []),
                 "topic_out": (
                     [{"topic": f"{input_topic}/obstacle", "format": "data/json"}]
