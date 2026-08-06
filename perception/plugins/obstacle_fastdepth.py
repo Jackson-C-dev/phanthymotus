@@ -89,6 +89,11 @@ TOOLS = [
                 "no_obstacle_distance": {"type": "number", "scope": "instance"},
                 "distance_scale": {"type": "number", "scope": "instance"},
                 "distance_bias": {"type": "number", "scope": "instance"},
+                "decision_distance_m": {"type": "number", "scope": "instance"},
+                "indoor_positive_depth_m": {"type": "number", "scope": "instance"},
+                "outdoor_positive_depth_m": {"type": "number", "scope": "instance"},
+                "boundary_margin_m": {"type": "number", "scope": "instance"},
+                "bias_warning_min_samples": {"type": "integer", "scope": "instance"},
             },
             "required": ["provider"],
         },
@@ -166,6 +171,48 @@ class FastDepthDistanceAdapter:
         )
         self._distance_scale = float(cfg.get("distance_scale", 1.0))
         self._distance_bias = float(cfg.get("distance_bias", 0.0))
+        self._decision_distance = float(cfg.get("decision_distance_m", 1.0))
+        if not self._min_distance < self._decision_distance < self._max_distance:
+            raise ValueError(
+                "decision_distance_m must be inside the configured distance range"
+            )
+        self._positive_depth_thresholds = {
+            "indoor": float(
+                cfg.get("indoor_positive_depth_m", self._decision_distance)
+            ),
+            "outdoor": float(
+                cfg.get("outdoor_positive_depth_m", self._decision_distance)
+            ),
+        }
+        for scene, threshold in self._positive_depth_thresholds.items():
+            if not self._min_distance < threshold < self._max_distance:
+                raise ValueError(
+                    f"{scene}_positive_depth_m must be inside the distance range"
+                )
+        max_margin = min(
+            self._decision_distance - self._min_distance,
+            self._max_distance - self._decision_distance,
+        )
+        self._boundary_margin = min(
+            max(0.001, float(cfg.get("boundary_margin_m", 0.02))),
+            max_margin,
+        )
+        self._bias_warning_min_samples = max(
+            10, int(cfg.get("bias_warning_min_samples", 20))
+        )
+        self._stats_lock = threading.Lock()
+        self._prediction_count = 0
+        self._positive_count = 0
+        self._negative_count = 0
+        self._raw_distance_sum = 0.0
+        self._raw_distance_min = math.inf
+        self._raw_distance_max = -math.inf
+        self._recent_raw_distances: list[float] = []
+        self._scene_counts = {
+            "indoor": {"total": 0, "positive": 0},
+            "outdoor": {"total": 0, "positive": 0},
+        }
+        self._last_raw_distance = self.fallback_distance
         self._max_inference_seconds = float(cfg.get("max_inference_seconds", 3.0))
         self._lock = threading.Lock()
 
@@ -253,12 +300,15 @@ class FastDepthDistanceAdapter:
         )
         log.info(
             "[obstacle-fastdepth] model=%s size=%.2fMiB providers=%s "
-            "gpu_limit_mb=%d trt_workspace_mb=%d",
+            "gpu_limit_mb=%d trt_workspace_mb=%d decision_distance_m=%.3f "
+            "positive_depth_m=%s",
             self._model_path,
             self._model_path.stat().st_size / _MIB,
             self._providers,
             0 if self._providers == ["CPUExecutionProvider"] else gpu_limit // _MIB,
             0 if "TensorrtExecutionProvider" not in self._providers else trt_workspace // _MIB,
+            self._decision_distance,
+            self._positive_depth_thresholds,
         )
 
     @staticmethod
@@ -311,6 +361,112 @@ class FastDepthDistanceAdapter:
             )
         )
 
+    def _calibrate_for_f1(self, raw_distance: float, scene: str) -> float:
+        """Map a scene-specific raw cutoff onto the evaluator's 1 m boundary.
+
+        FastDepth was trained on NYU indoor data, so its absolute scale may move
+        under a different camera/domain.  Separate raw cutoffs let a validation
+        set correct that scale without changing the evaluator-facing definition:
+        every raw value below the cutoff maps strictly below decision_distance,
+        and every other value maps strictly above it.
+        """
+
+        raw_distance = float(
+            np.clip(raw_distance, self._min_distance, self._max_distance)
+        )
+        threshold = self._positive_depth_thresholds[scene]
+        if raw_distance < threshold:
+            fraction = (raw_distance - self._min_distance) / max(
+                1e-9, threshold - self._min_distance
+            )
+            upper = self._decision_distance - self._boundary_margin
+            return self._min_distance + fraction * (upper - self._min_distance)
+
+        fraction = (raw_distance - threshold) / max(
+            1e-9, self._max_distance - threshold
+        )
+        lower = self._decision_distance + self._boundary_margin
+        return lower + fraction * (self._max_distance - lower)
+
+    def _record_prediction(
+        self, raw_distance: float, distance: float, scene: str
+    ) -> None:
+        with self._stats_lock:
+            positive = distance < self._decision_distance
+            self._prediction_count += 1
+            self._positive_count += int(positive)
+            self._negative_count += int(not positive)
+            self._scene_counts[scene]["total"] += 1
+            self._scene_counts[scene]["positive"] += int(positive)
+            self._last_raw_distance = float(raw_distance)
+            self._raw_distance_sum += float(raw_distance)
+            self._raw_distance_min = min(self._raw_distance_min, float(raw_distance))
+            self._raw_distance_max = max(self._raw_distance_max, float(raw_distance))
+            self._recent_raw_distances.append(float(raw_distance))
+            if len(self._recent_raw_distances) > 256:
+                del self._recent_raw_distances[0]
+            count = self._prediction_count
+            positive_rate = self._positive_count / count
+            recent = np.asarray(self._recent_raw_distances, dtype=np.float32)
+            raw_p25 = float(np.quantile(recent, 0.25))
+            raw_p50 = float(np.quantile(recent, 0.50))
+
+        if count >= self._bias_warning_min_samples and (
+            count % self._bias_warning_min_samples == 0
+        ) and (positive_rate <= 0.05 or positive_rate >= 0.95):
+            log.warning(
+                "[obstacle-fastdepth] prediction distribution is highly one-sided: "
+                "samples=%d positive_rate=%.3f; calibrate indoor/outdoor_positive_depth_m "
+                "on a labeled validation split (recent raw p25=%.3f p50=%.3f)",
+                count,
+                positive_rate,
+                raw_p25,
+                raw_p50,
+            )
+
+    def calibration_stats(self) -> dict:
+        with self._stats_lock:
+            total = self._prediction_count
+            recent = np.asarray(self._recent_raw_distances, dtype=np.float32)
+            if recent.size:
+                raw_quantiles = {
+                    "p10": float(np.quantile(recent, 0.10)),
+                    "p25": float(np.quantile(recent, 0.25)),
+                    "p50": float(np.quantile(recent, 0.50)),
+                    "p75": float(np.quantile(recent, 0.75)),
+                    "p90": float(np.quantile(recent, 0.90)),
+                }
+            else:
+                raw_quantiles = {}
+            scenes = {
+                scene: {
+                    "total": values["total"],
+                    "positive": values["positive"],
+                    "positive_rate": values["positive"] / max(1, values["total"]),
+                }
+                for scene, values in self._scene_counts.items()
+            }
+            return {
+                "decision_distance_m": self._decision_distance,
+                "positive_depth_m": dict(self._positive_depth_thresholds),
+                "prediction_count": total,
+                "positive_count": self._positive_count,
+                "negative_count": self._negative_count,
+                "positive_rate": self._positive_count / max(1, total),
+                "last_raw_distance": self._last_raw_distance,
+                "raw_distance_min": (
+                    self._raw_distance_min if total else None
+                ),
+                "raw_distance_max": (
+                    self._raw_distance_max if total else None
+                ),
+                "raw_distance_mean": (
+                    self._raw_distance_sum / total if total else None
+                ),
+                "raw_distance_quantiles": raw_quantiles,
+                "scenes": scenes,
+            }
+
     def estimate(self, image_bytes: bytes) -> dict:
         started = time.perf_counter()
         tensor = self._preprocess(image_bytes)
@@ -319,7 +475,9 @@ class FastDepthDistanceAdapter:
                 [self._output_name], {self._input_name: tensor}
             )[0]
         scene = self._scene(image_bytes)
-        distance = self._distance(depth, scene)
+        raw_distance = self._distance(depth, scene)
+        distance = self._calibrate_for_f1(raw_distance, scene)
+        self._record_prediction(raw_distance, distance, scene)
         elapsed = time.perf_counter() - started
         if elapsed > self._max_inference_seconds:
             log.warning(
@@ -329,6 +487,7 @@ class FastDepthDistanceAdapter:
             )
         return {
             "pred_distance": distance,
+            "raw_distance": raw_distance,
             "scene": scene,
             "latency_ms": elapsed * 1000.0,
         }
@@ -388,4 +547,11 @@ class ObstacleFastDepthPlugin(ObstacleDistancePlugin):
         if action == "info" and result is not None:
             result["model"] = "FastDepth-224x224-NYUv2"
             result["desc"] = "FastDepth metric-depth obstacle distance from camera feed"
+            result["calibration"] = self._adapter.calibration_stats()
+            for key, node in self._nodes.items():
+                if key in result.get("instances", {}):
+                    result["instances"][key]["calibration"] = (
+                        node._adapter.calibration_stats()
+                    )
         return result
+
