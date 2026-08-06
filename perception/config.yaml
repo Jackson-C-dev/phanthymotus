@@ -85,9 +85,9 @@ plugins:
   obstacleRule:
     enabled: false       # CPU-only dry-run implementation
     provider: rule
-    # Deterministic dry-run: accept each non-empty image and publish this distance.
-    # Set to null to enable the CPU/OpenCV connected-component heuristic.
-    fixed_distance_m: 1.5
+    # null enables image-dependent CPU/OpenCV analysis. Set a numeric value only
+    # when a deliberately constant connectivity-test result is required.
+    fixed_distance_m: null
     no_obstacle_distance: 10.0
     near_distance_m: 0.5
     far_distance_m: 5.0
