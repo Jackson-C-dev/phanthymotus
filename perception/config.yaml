@@ -83,7 +83,7 @@ plugins:
     use_dla: false
 
   obstacleRule:
-    enabled: true        # CPU-only dry-run implementation
+    enabled: false       # CPU-only dry-run implementation
     provider: rule
     # Deterministic dry-run: accept each non-empty image and publish this distance.
     # Set to null to enable the CPU/OpenCV connected-component heuristic.
@@ -93,3 +93,24 @@ plugins:
     far_distance_m: 5.0
     processing_width: 320
     processing_height: 240
+
+  obstacleFastDepth:
+    # Only one obstacle implementation may be enabled because each intentionally
+    # exposes the evaluator-facing tool/prefix name "obstacle".
+    enabled: true
+    provider: fastdepth
+    # Directory cache. utils.model_downloader downloads the configured
+    # obstacle_fastdepth single-file artifact here when it is missing.
+    model_path: "/models/fastdepth"
+    # CPU is the safe default for the strict shared-memory budget on Jetson.
+    # Change to cuda or tensorrt only when the container has a GPU allocation.
+    execution_provider: cpu
+    cpu_threads: 1
+    gpu_memory_limit_mb: 192
+    trt_workspace_limit_mb: 32
+    scene_mode: auto
+    indoor_quantile: 0.01
+    outdoor_quantile: 0.05
+    min_distance: 0.05
+    max_distance: 10.0
+    no_obstacle_distance: 10.0
