@@ -83,7 +83,7 @@ plugins:
     use_dla: false
 
   obstacleRule:
-    enabled: true       # CPU-only dry-run implementation
+    enabled: false       # CPU-only dry-run implementation
     provider: rule
     # null enables image-dependent CPU/OpenCV analysis. Set a numeric value only
     # when a deliberately constant connectivity-test result is required.
@@ -105,7 +105,7 @@ plugins:
   obstacleFastDepth:
     # Only one obstacle implementation may be enabled because each intentionally
     # exposes the evaluator-facing tool/prefix name "obstacle".
-    enabled: false
+    enabled: true
     provider: fastdepth
     # Directory cache. utils.model_downloader downloads the configured
     # obstacle_fastdepth single-file artifact here when it is missing.
@@ -122,3 +122,13 @@ plugins:
     min_distance: 0.05
     max_distance: 10.0
     no_obstacle_distance: 10.0
+    # Evaluation: pred_distance < 1 m is positive. FastDepth is NYU-indoor
+    # trained, so calibrate its raw cutoff independently for each domain using
+    # a labeled validation split. 1.5 is a permissive initial cutoff for the
+    # observed all-negative domain shift; tune it from info.calibration raw
+    # quantiles rather than forcing a fixed positive/negative ratio.
+    decision_distance_m: 1.0
+    indoor_positive_depth_m: 1.5
+    outdoor_positive_depth_m: 1.5
+    boundary_margin_m: 0.02
+    bias_warning_min_samples: 20
