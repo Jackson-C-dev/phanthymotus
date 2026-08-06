@@ -3,7 +3,7 @@
 
 Public protocol compatibility with ``plugins/obstacle.py``:
 
-* MCP tool/prefix: ``obstacleRule``;
+* MCP tool/prefix: ``obstacle``;
 * actions: ``start``, ``stop``, ``info`` and ``config``;
 * input: ``sensor_msgs/CompressedImage``;
 * output topic: ``<input_topic>/obstacle``;
@@ -72,7 +72,7 @@ else:
 
 TOOLS = [
     {
-        "name": "obstacleRule",
+        "name": "obstacle",
         "type": "processor",
         "multiInstance": True,
         "description": "CPU-only rule-based obstacle distance for dry runs",
@@ -352,9 +352,9 @@ class _ObstacleRuleNode(Node):
 
 
 class ObstacleRuleDistancePlugin:
-    """CPU-only rule-based implementation exposed as ``obstacleRule``."""
+    """CPU-only rule-based implementation exposed as ``obstacle``."""
 
-    PREFIX = "obstacleRule"
+    PREFIX = "obstacle"
 
     def __init__(self, plugin_cfg: dict, executor):
         if not _ROS2_AVAILABLE:
@@ -463,3 +463,4 @@ class ObstacleRuleDistancePlugin:
             return {"status": "configured", "config": cfg}
 
         return None
+
