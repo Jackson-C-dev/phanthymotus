@@ -102,6 +102,13 @@ class PerceptionBundle:
             self._plugins.append(ObstacleDistancePlugin(plugins_cfg["obstacle"], executor))
             log.info("ObstacleDistancePlugin loaded")
 
+        if plugins_cfg.get("obstacleRule", {}).get("enabled", False):
+            from plugins.obstacle_rule import ObstacleRuleDistancePlugin
+            self._plugins.append(
+                ObstacleRuleDistancePlugin(plugins_cfg["obstacleRule"], executor)
+            )
+            log.info("ObstacleRuleDistancePlugin loaded (CPU-only, no model)")
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:
@@ -455,4 +462,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
