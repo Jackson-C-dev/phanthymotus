@@ -109,6 +109,13 @@ class PerceptionBundle:
             )
             log.info("ObstacleRuleDistancePlugin loaded (CPU-only, no model)")
 
+        if plugins_cfg.get("obstacleFastDepth", {}).get("enabled", False):
+            from plugins.obstacle_fastdepth import ObstacleFastDepthPlugin
+            self._plugins.append(
+                ObstacleFastDepthPlugin(plugins_cfg["obstacleFastDepth"], executor)
+            )
+            log.info("ObstacleFastDepthPlugin loaded as tool=obstacle")
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:
@@ -462,5 +469,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
