@@ -42,7 +42,13 @@ MODELS = {
     "obstacle": {
         "url": f"{JUICEFS_BASE}/obstacle-distance.tar.bz2",
         "check_file": "yolo26n-depth.onnx",
-    },}
+    },
+    "obstacle_fastdepth": {
+        "url": f"{JUICEFS_BASE}/fast_depth_224x224.onnx",
+        "check_file": "fast_depth_224x224.onnx",
+        "single_file": True,
+    },
+}
 
 
 def ensure_model(name: str, model_dir: str) -> None:
@@ -147,3 +153,4 @@ def _common_prefix_from_names(names: list[str]) -> str:
     if len(first_parts) == 1:
         return first_parts.pop() + "/"
     return ""
+
