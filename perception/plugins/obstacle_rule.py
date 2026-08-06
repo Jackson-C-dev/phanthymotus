@@ -9,11 +9,12 @@ Public protocol compatibility with ``plugins/obstacle.py``:
 * output topic: ``<input_topic>/obstacle``;
 * output payload: ``{"pred_distance": <float metres>}``.
 
-No model runtime is imported or initialized.  ``fixed_distance_m`` provides a
-fully deterministic dry-run.  Setting it to null enables a lightweight OpenCV
-heuristic based on central-ROI edges, local contrast, connected components and
-perspective position.  The heuristic is only a pipeline fallback and is not a
-replacement for metric monocular-depth inference.
+No model runtime is imported or initialized.  The default is a lightweight
+OpenCV heuristic based on central-ROI edges, local contrast, connected
+components and perspective position.  ``fixed_distance_m`` may still be set to
+a number for a deterministic connectivity-only dry run.  The heuristic is only
+a pipeline fallback and is not a replacement for metric monocular-depth
+inference.
 """
 
 from __future__ import annotations
@@ -131,7 +132,10 @@ class RuleBasedDistanceAdapter:
         if provider != "rule":
             raise ValueError("obstacleRule provider must be 'rule'")
 
-        fixed = cfg.get("fixed_distance_m", 1.5)
+        # Image-dependent inference is the normal rule-based mode. A numeric
+        # value is an explicit opt-in test stub and intentionally returns the
+        # same distance for every non-empty image.
+        fixed = cfg.get("fixed_distance_m", None)
         self._fixed_distance = None if fixed is None or fixed == "" else float(fixed)
         if self._fixed_distance is not None and self._fixed_distance < 0.0:
             raise ValueError("fixed_distance_m must be non-negative or null")
