@@ -83,7 +83,7 @@ plugins:
     use_dla: false
 
   obstacleRule:
-    enabled: false       # CPU-only dry-run implementation
+    enabled: true       # CPU-only dry-run implementation
     provider: rule
     # null enables image-dependent CPU/OpenCV analysis. Set a numeric value only
     # when a deliberately constant connectivity-test result is required.
@@ -91,13 +91,21 @@ plugins:
     no_obstacle_distance: 10.0
     near_distance_m: 0.5
     far_distance_m: 5.0
+    # The leaderboard classifies pred_distance < 1 m as positive. Keep this
+    # boundary explicit instead of deriving it indirectly from near/far values.
+    decision_distance_m: 1.0
+    # Lower values favor recall; higher values favor precision. Tune this on a
+    # labeled validation split instead of targeting a 50% positive rate.
+    positive_score_threshold: 0.62
+    boundary_margin_m: 0.02
+    score_threshold: 0.18
     processing_width: 320
     processing_height: 240
 
   obstacleFastDepth:
     # Only one obstacle implementation may be enabled because each intentionally
     # exposes the evaluator-facing tool/prefix name "obstacle".
-    enabled: true
+    enabled: false
     provider: fastdepth
     # Directory cache. utils.model_downloader downloads the configured
     # obstacle_fastdepth single-file artifact here when it is missing.
