@@ -1,3 +1,5 @@
+
+
 #!/usr/bin/env python3
 """FastDepth implementation of the public ``obstacle`` MCP/ROS2 tool.
 
@@ -35,6 +37,7 @@ from plugins.obstacle import ObstacleDistancePlugin
 log = logging.getLogger(__name__)
 
 _MIB = 1024 * 1024
+_DEFAULT_DECISION_DISTANCE_M = 2.0
 
 
 TOOLS = [
@@ -171,7 +174,9 @@ class FastDepthDistanceAdapter:
         )
         self._distance_scale = float(cfg.get("distance_scale", 1.0))
         self._distance_bias = float(cfg.get("distance_bias", 0.0))
-        self._decision_distance = float(cfg.get("decision_distance_m", 1.0))
+        self._decision_distance = float(
+            cfg.get("decision_distance_m", _DEFAULT_DECISION_DISTANCE_M)
+        )
         if not self._min_distance < self._decision_distance < self._max_distance:
             raise ValueError(
                 "decision_distance_m must be inside the configured distance range"
@@ -362,13 +367,15 @@ class FastDepthDistanceAdapter:
         )
 
     def _calibrate_for_f1(self, raw_distance: float, scene: str) -> float:
-        """Map a scene-specific raw cutoff onto the evaluator's 1 m boundary.
+        """Map a scene-specific raw cutoff onto the configured decision boundary.
 
         FastDepth was trained on NYU indoor data, so its absolute scale may move
         under a different camera/domain.  Separate raw cutoffs let a validation
         set correct that scale without changing the evaluator-facing definition:
         every raw value below the cutoff maps strictly below decision_distance,
-        and every other value maps strictly above it.
+        and every other value maps strictly above it.  With the current product
+        configuration this means ``pred_distance < 2 m`` is positive and
+        ``pred_distance >= 2 m`` is negative.
         """
 
         raw_distance = float(
@@ -554,4 +561,3 @@ class ObstacleFastDepthPlugin(ObstacleDistancePlugin):
                         node._adapter.calibration_stats()
                     )
         return result
-
