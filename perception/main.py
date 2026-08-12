@@ -98,9 +98,13 @@ class PerceptionBundle:
             log.info("OCRPlugin loaded")
 
         if plugins_cfg.get("obstacle", {}).get("enabled", False):
-            from plugins.obstacle import ObstacleDistancePlugin
+            obstacle_cfg = plugins_cfg["obstacle"]
+            if str(obstacle_cfg.get("provider", "local")).lower() in {"openai", "qwen"}:
+                from plugins.obstacle_code import ObstacleDistancePlugin
+            else:
+                from plugins.obstacle import ObstacleDistancePlugin
             self._plugins.append(ObstacleDistancePlugin(plugins_cfg["obstacle"], executor))
-            log.info("ObstacleDistancePlugin loaded")
+            log.info("ObstacleDistancePlugin loaded as tool=obstacle")
 
         if plugins_cfg.get("obstacleRule", {}).get("enabled", False):
             from plugins.obstacle_rule import ObstacleRuleDistancePlugin
@@ -469,4 +473,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
