@@ -73,16 +73,16 @@ plugins:
     # "obstacle". Enable exactly one of obstacle / obstacleRule /
     # obstacleFastDepth. For a remote API set provider to openai or qwen; local
     # keeps using plugins/obstacle.py.
-    enabled: false
-    provider: local       # openai | qwen | local
+    enabled: true
+    provider: qwen       # openai | qwen | local
     # API base only; do not append /chat/completions. Empty selects the provider
     # default or OBSTACLE_API_BASE from the container environment.
-    url: ""
+    url: "http://172.28.4.72:32527/v1"
     # Keep this empty in a public repository. Preferred environment variables:
     # OBSTACLE_API_KEY, OPENAI_API_KEY, or DASHSCOPE_API_KEY.
     key: ""
     # Empty selects gpt-4o-mini / qwen-vl-max, or OBSTACLE_API_MODEL.
-    model: ""
+    model: "qwen3.5-27b"
     decision_distance_m: 2.0
     boundary_margin_m: 0.02
     no_obstacle_distance: 10.0
@@ -119,7 +119,7 @@ plugins:
   obstacleFastDepth:
     # Only one obstacle implementation may be enabled because each intentionally
     # exposes the evaluator-facing tool/prefix name "obstacle".
-    enabled: true
+    enabled: false
     provider: fastdepth
     # Directory cache. utils.model_downloader downloads the configured
     # obstacle_fastdepth single-file artifact here when it is missing.
