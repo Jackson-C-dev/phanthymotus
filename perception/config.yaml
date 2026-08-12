@@ -69,11 +69,25 @@ plugins:
     language: "zh"     # default language hint
 
   obstacle:
-    enabled: false       # model-based implementation; disable for the CPU-only dry run
-    provider: local    # openai | qwen | local
-    url: ""          # API URL (empty = default endpoint)
-    key: ""          # API Key
-    model: ""        # model name
+    # All obstacle implementations expose the same evaluator-facing tool name
+    # "obstacle". Enable exactly one of obstacle / obstacleRule /
+    # obstacleFastDepth. For a remote API set provider to openai or qwen; local
+    # keeps using plugins/obstacle.py.
+    enabled: false
+    provider: local       # openai | qwen | local
+    # API base only; do not append /chat/completions. Empty selects the provider
+    # default or OBSTACLE_API_BASE from the container environment.
+    url: ""
+    # Keep this empty in a public repository. Preferred environment variables:
+    # OBSTACLE_API_KEY, OPENAI_API_KEY, or DASHSCOPE_API_KEY.
+    key: ""
+    # Empty selects gpt-4o-mini / qwen-vl-max, or OBSTACLE_API_MODEL.
+    model: ""
+    decision_distance_m: 2.0
+    boundary_margin_m: 0.02
+    no_obstacle_distance: 10.0
+    request_timeout_seconds: 30
+    request_retries: 1
     model_path: "/models/obstacle"
     # 8 GB Jetson runs 10 inference containers concurrently. Keep the
     # controllable CUDA/TensorRT budget below 450 MiB per container so CUDA
@@ -91,9 +105,9 @@ plugins:
     no_obstacle_distance: 10.0
     near_distance_m: 0.5
     far_distance_m: 5.0
-    # The leaderboard classifies pred_distance < 1 m as positive. Keep this
+    # The product classifies pred_distance < 2 m as positive. Keep this
     # boundary explicit instead of deriving it indirectly from near/far values.
-    decision_distance_m: 1.0
+    decision_distance_m: 2.0
     # Lower values favor recall; higher values favor precision. Tune this on a
     # labeled validation split instead of targeting a 50% positive rate.
     positive_score_threshold: 0.62
