@@ -80,7 +80,7 @@ plugins:
     url: "http://172.28.4.72:32527/v1"
     # Keep this empty in a public repository. Preferred environment variables:
     # OBSTACLE_API_KEY, OPENAI_API_KEY, or DASHSCOPE_API_KEY.
-    key: ""
+    key: "EMPTY"
     # Empty selects gpt-4o-mini / qwen-vl-max, or OBSTACLE_API_MODEL.
     model: "qwen3.5-27b"
     decision_distance_m: 2.0
