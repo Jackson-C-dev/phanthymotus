@@ -81,6 +81,9 @@ TOOLS = [
                 "no_obstacle_distance": {"type": "number", "scope": "instance"},
                 "request_timeout_seconds": {"type": "number", "scope": "shared"},
                 "request_retries": {"type": "integer", "scope": "shared"},
+                "enable_thinking": {"type": "boolean", "scope": "shared"},
+                "image_min_pixels": {"type": "integer", "scope": "shared"},
+                "image_max_pixels": {"type": "integer", "scope": "shared"},
             },
             "required": ["provider"]
         },
@@ -124,6 +127,78 @@ def _as_bool(value: Any) -> Optional[bool]:
     return None
 
 
+_DISTANCE_BAND_BOUNDS = {
+    "lt_0_5m": (0.05, 0.5),
+    "0_5_to_1m": (0.5, 1.0),
+    "1_to_1_5m": (1.0, 1.5),
+    "1_5_to_2m": (1.5, 2.0),
+    "2_to_3m": (2.0, 3.0),
+    "3_to_5m": (3.0, 5.0),
+    "gt_5m": (5.0, math.inf),
+}
+
+
+def _normalize_distance_band(value: Any) -> str:
+    """Normalize the small set of bands requested in the prompt."""
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[\s\-]+", "_", text).replace(".", "_")
+    aliases = {
+        "<0_5m": "lt_0_5m",
+        "under_0_5m": "lt_0_5m",
+        "0_5_1m": "0_5_to_1m",
+        "1_1_5m": "1_to_1_5m",
+        "1_5_2m": "1_5_to_2m",
+        "2_3m": "2_to_3m",
+        "3_5m": "3_to_5m",
+        ">5m": "gt_5m",
+        "over_5m": "gt_5m",
+        "no_obstacle": "none",
+        "not_visible": "none",
+    }
+    return aliases.get(text, text)
+
+
+def _build_distance_prompt(
+    decision_distance_m: float,
+    no_obstacle_distance: float,
+    *,
+    language: str,
+) -> str:
+    """Build a classification-first prompt instead of asking for a blind metric guess."""
+    threshold = f"{decision_distance_m:g}"
+    fallback = f"{no_obstacle_distance:g}"
+    bands = (
+        "lt_0_5m, 0_5_to_1m, 1_to_1_5m, 1_5_to_2m, "
+        "2_to_3m, 3_to_5m, gt_5m, none"
+    )
+    if language == "zh":
+        return f"""你是机器人前向相机的障碍物风险判定器。主目标不是伪造精确深度，而是正确判断最近的可碰撞障碍物是否严格小于 {threshold} 米。
+
+请在内部按以下顺序检查，但最终只输出 JSON：
+1. 找出与机器人前进行驶走廊相交的、最近的实体障碍物。完整查看画面，重点关注中间约 70% 宽度和下方约 85% 高度；不要忽略贴近画面底部的低矮或被截断障碍物。
+2. 地面/道路本身、阴影、天空、天花板，以及行驶走廊外的墙面和建筑不是障碍物；但走廊内的箱子、桌椅腿、路沿、车辆、行人和突出物属于障碍物。
+3. 综合使用障碍物在画面中的占比、底部接地点、透视关系、遮挡/截断程度和常见物体尺度。接地点越靠近画面底部、物体越大或被近距离截断，通常越近。不要仅凭物体类别猜距离。
+4. 先选择距离档位，再判断是否小于 {threshold} 米，最后给出档位内的代表距离。临界不确定时基于视觉证据选择一侧，不要习惯性全部判远或全部判近。
+
+distance_band 只能是以下之一：{bands}。
+返回字段：obstacle_present（布尔）、nearest_obstacle（字符串）、distance_band（字符串）、is_within_threshold（布尔）、pred_distance（米，数字）、confidence（0到1）、visual_evidence（简短字符串）。
+若无相关障碍物：obstacle_present=false、distance_band="none"、is_within_threshold=false、pred_distance={fallback}。
+字段必须互相一致：小于 {threshold} 米时 is_within_threshold=true，否则为 false。只输出一个 JSON 对象，不要 Markdown，不要额外文字。"""
+
+    return f"""You are a collision-risk judge for a robot's forward camera. The primary goal is not false metric precision; it is correctly deciding whether the nearest collidable obstacle is strictly closer than {threshold} meters.
+
+Inspect internally in this order, but return only JSON:
+1. Locate the nearest solid obstacle intersecting the robot's forward travel corridor. Inspect the full frame, prioritizing roughly the central 70% width and lower 85% height. Do not ignore low or truncated objects near the bottom edge.
+2. Floor/road surface, shadows, sky, ceiling, and walls/buildings outside the travel corridor are not obstacles. Boxes, furniture legs, curbs, vehicles, people, and protrusions inside the corridor are obstacles.
+3. Combine image occupancy, ground-contact position, perspective, occlusion/cropping, and familiar object scale. A lower contact point, larger apparent size, or near-frame truncation usually means closer. Do not infer distance from object class alone.
+4. Select a distance band first, decide the {threshold} m class second, then provide a representative distance inside that band. For ambiguous boundary cases, choose from visual evidence instead of defaulting every case to far or near.
+
+distance_band must be one of: {bands}.
+Return: obstacle_present (boolean), nearest_obstacle (string), distance_band (string), is_within_threshold (boolean), pred_distance (meters, number), confidence (0..1), visual_evidence (short string).
+If no relevant obstacle exists, use obstacle_present=false, distance_band="none", is_within_threshold=false, pred_distance={fallback}.
+Fields must agree: is_within_threshold is true exactly when distance is below {threshold} m. Output one JSON object only, without Markdown or extra text."""
+
+
 def _extract_json_object(content: Any) -> dict:
     if isinstance(content, dict):
         return content
@@ -159,34 +234,90 @@ def _normalize_prediction(
     boundary_margin_m: float,
     no_obstacle_distance: float,
 ) -> dict:
-    try:
-        distance = float(parsed.get("pred_distance", no_obstacle_distance))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("pred_distance must be numeric") from exc
-    if not math.isfinite(distance):
-        raise ValueError("pred_distance must be finite")
+    obstacle_present = _as_bool(parsed.get("obstacle_present"))
+    band = _normalize_distance_band(parsed.get("distance_band"))
+    bounds = _DISTANCE_BAND_BOUNDS.get(band)
 
-    distance = min(max(distance, 0.05), no_obstacle_distance)
-    is_positive = _as_bool(parsed.get("is_within_2m"))
-    if is_positive is not None:
-        # The leaderboard class is determined exclusively by the 2 m boundary.
-        # Keep the model's metric estimate when it is consistent; otherwise move
-        # it to the nearest safe side of the boundary.
-        if is_positive:
-            distance = min(distance, decision_distance_m - boundary_margin_m)
-        else:
-            distance = max(distance, decision_distance_m + boundary_margin_m)
+    raw_distance: Optional[float]
+    try:
+        raw_distance = float(parsed["pred_distance"])
+        if not math.isfinite(raw_distance):
+            raw_distance = None
+    except (KeyError, TypeError, ValueError):
+        raw_distance = None
+
+    stated_positive = _as_bool(parsed.get("is_within_threshold"))
+    if stated_positive is None:
+        # Backward compatibility with the first prompt/output contract.
+        stated_positive = _as_bool(parsed.get("is_within_2m"))
+
+    vote_values: list[bool] = []
+    if obstacle_present is False or band == "none":
+        distance = no_obstacle_distance
+        final_positive = False
+    else:
+        band_distance: Optional[float] = None
+        band_positive: Optional[bool] = None
+        if bounds is not None:
+            low, high = bounds
+            clipped_high = min(high, no_obstacle_distance)
+            band_distance = (low + clipped_high) / 2.0
+            if high <= decision_distance_m:
+                band_positive = True
+            elif low >= decision_distance_m:
+                band_positive = False
+
+        distance = raw_distance if raw_distance is not None else band_distance
+        if distance is None:
+            raise ValueError(
+                "response requires a numeric pred_distance or valid distance_band"
+            )
+        distance = min(max(distance, 0.05), no_obstacle_distance)
+        distance_positive = distance < decision_distance_m
+        vote_values = [distance_positive]
+        if band_positive is not None:
+            vote_values.append(band_positive)
+        if stated_positive is not None:
+            vote_values.append(stated_positive)
+
+        positive_votes = sum(1 for vote in vote_values if vote)
+        negative_votes = len(vote_values) - positive_votes
+        # Metric distance is the least ambiguous fallback in a two-way tie.
+        final_positive = (
+            distance_positive
+            if positive_votes == negative_votes
+            else positive_votes > negative_votes
+        )
+
+        # Keep the continuous output consistent with the majority class. Prefer
+        # the band's midpoint over collapsing every conflict to 1.98 or 2.02,
+        # which previously created an artificial boundary spike.
+        if final_positive and distance >= decision_distance_m:
+            if band_distance is not None and band_distance < decision_distance_m:
+                distance = band_distance
+            else:
+                distance = decision_distance_m - boundary_margin_m
+        elif not final_positive and distance < decision_distance_m:
+            if band_distance is not None and band_distance >= decision_distance_m:
+                distance = band_distance
+            else:
+                distance = decision_distance_m + boundary_margin_m
 
     try:
         confidence = float(parsed.get("confidence", 0.0))
     except (TypeError, ValueError):
         confidence = 0.0
     confidence = min(max(confidence, 0.0), 1.0)
+    if len(set(vote_values)) > 1:
+        confidence *= 0.65
     return {
         "pred_distance": distance,
-        "is_positive": distance < decision_distance_m,
+        "is_positive": final_positive,
         "confidence": confidence,
-        "reasoning": str(parsed.get("reasoning", ""))[:500],
+        "distance_band": band,
+        "reasoning": str(
+            parsed.get("visual_evidence") or parsed.get("reasoning", "")
+        )[:500],
     }
 
 
@@ -237,6 +368,20 @@ def _post_chat_completion(
                     headers=headers,
                     timeout=timeout_seconds,
                 )
+            if (
+                response.status_code == 400
+                and "enable_thinking" in request_payload
+                and "enable_thinking" in response.text.lower()
+            ):
+                # Third-party OpenAI-compatible Qwen gateways may not expose the
+                # DashScope-specific switch. Retry without losing compatibility.
+                request_payload.pop("enable_thinking", None)
+                response = requests.post(
+                    endpoint,
+                    json=request_payload,
+                    headers=headers,
+                    timeout=timeout_seconds,
+                )
             response.raise_for_status()
             result = response.json()
             return result.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -254,27 +399,6 @@ def _post_chat_completion(
 
 class OpenAIVisionDistanceAdapter(DistanceAdapter):
     """OpenAI Vision API 距离估计"""
-
-    _SYSTEM_PROMPT = (
-        "You are an obstacle distance estimation system for a robot camera.\n\n"
-        "Your task is to analyze the provided image, determine whether the nearest "
-        "obstacle is strictly closer than 2 meters, and estimate its distance.\n\n"
-        "Output format: Return a JSON object with:\n"
-        '- "is_within_2m": true only when distance is strictly below 2m (boolean)\n'
-        '- "pred_distance": estimated distance in meters (float)\n'
-        '- "confidence": confidence score 0-1 (float)\n'
-        '- "reasoning": brief explanation of your estimation\n\n'
-        "Rules:\n"
-        "1. Distance should be in meters.\n"
-        "2. If no obstacle is visible, return a large value (e.g., 10.0).\n"
-        "3. For indoor robot images, consider the central one-third width and upper "
-        "five-eighths height; ignore the floor.\n"
-        "4. For outdoor driving images, consider traffic participants and movable "
-        "obstacles in front of the ego vehicle; ignore road surface and buildings.\n"
-        "5. Output ONLY the JSON object, nothing else.\n\n"
-        'Example: {"is_within_2m": true, "pred_distance": 1.25, '
-        '"confidence": 0.85, "reasoning": "nearest obstacle is clearly within 2m"}'
-    )
 
     def __init__(
         self,
@@ -296,6 +420,9 @@ class OpenAIVisionDistanceAdapter(DistanceAdapter):
         self.no_obstacle_distance = no_obstacle_distance
         self.timeout_seconds = timeout_seconds
         self.retries = retries
+        self._system_prompt = _build_distance_prompt(
+            decision_distance_m, no_obstacle_distance, language="en"
+        )
 
     def estimate(self, image_bytes: bytes) -> dict:
         import base64
@@ -311,7 +438,7 @@ class OpenAIVisionDistanceAdapter(DistanceAdapter):
             image_format = "webp"
 
         messages = [
-            {"role": "system", "content": self._SYSTEM_PROMPT},
+            {"role": "system", "content": self._system_prompt},
             {
                 "role": "user",
                 "content": [
@@ -324,7 +451,7 @@ class OpenAIVisionDistanceAdapter(DistanceAdapter):
                     },
                     {
                         "type": "text",
-                        "text": "Estimate the distance to the nearest obstacle in this image."
+                        "text": "Analyze the forward collision corridor and return the requested JSON."
                     }
                 ]
             }
@@ -356,28 +483,24 @@ class OpenAIVisionDistanceAdapter(DistanceAdapter):
 class QwenVLDistanceAdapter(OpenAIVisionDistanceAdapter):
     """Qwen-VL 距离估计"""
 
-    _SYSTEM_PROMPT = (
-        "你是一个机器人摄像头障碍物距离估计系统。\n\n"
-        "任务：分析提供的图片，判断最近障碍物是否严格小于2米，并估计距离。\n\n"
-        "输出格式：返回 JSON 对象，包含：\n"
-        '- "is_within_2m": 严格小于2米时为 true，否则为 false（布尔值）\n'
-        '- "pred_distance": 估计距离（米，浮点数）\n'
-        '- "confidence": 置信度 0-1（浮点数）\n'
-        '- "reasoning": 简要说明\n\n'
-        "规则：\n"
-        "1. 距离单位为米。\n"
-        "2. 如果没有可见障碍物，返回较大值（如 10.0）。\n"
-        "3. 室内机器人图片只考虑图像中心1/3宽、上方5/8高的区域，排除地面。\n"
-        "4. 室外无人车图片考虑自车正前方交通参与者和可移动障碍物，排除路面和建筑。\n"
-        "5. 只输出 JSON 对象，不要其他内容。\n\n"
-        '示例：{"is_within_2m": true, "pred_distance": 1.25, '
-        '"confidence": 0.85, "reasoning": "最近障碍物明显在2米内"}'
-    )
-
     def __init__(self, url: str, key: str, model: str, **kwargs: Any):
+        thinking = _as_bool(kwargs.pop("enable_thinking", True))
+        self.enable_thinking = True if thinking is None else thinking
+        self.image_min_pixels = max(
+            65536, int(kwargs.pop("image_min_pixels", 262144))
+        )
+        self.image_max_pixels = max(
+            self.image_min_pixels,
+            int(kwargs.pop("image_max_pixels", 1048576)),
+        )
         super().__init__(url, key, model or "qwen-vl-max", **kwargs)
         self.base_url = _normalize_base_url(
             url, "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+        self._system_prompt = _build_distance_prompt(
+            self.decision_distance_m,
+            self.no_obstacle_distance,
+            language="zh",
         )
 
     def estimate(self, image_bytes: bytes) -> dict:
@@ -390,17 +513,21 @@ class QwenVLDistanceAdapter(OpenAIVisionDistanceAdapter):
             image_format = "png"
 
         messages = [
-            {"role": "system", "content": self._SYSTEM_PROMPT},
+            {"role": "system", "content": self._system_prompt},
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "image_url",
-                        "image_url": f"data:image/{image_format};base64,{image_b64}"
+                        "image_url": {
+                            "url": f"data:image/{image_format};base64,{image_b64}"
+                        },
+                        "min_pixels": self.image_min_pixels,
+                        "max_pixels": self.image_max_pixels,
                     },
                     {
                         "type": "text",
-                        "text": "估计这张图片中最近障碍物的距离。"
+                        "text": "分析机器人正前方可碰撞区域，并严格按要求返回 JSON。"
                     }
                 ]
             }
@@ -412,8 +539,10 @@ class QwenVLDistanceAdapter(OpenAIVisionDistanceAdapter):
             payload={
                 "model": self.model,
                 "messages": messages,
-                "max_tokens": 256,
                 "temperature": 0,
+                # Make Qwen3.5-27B's reasoning mode explicit. Some self-hosted
+                # gateways default it off even though DashScope defaults it on.
+                "enable_thinking": self.enable_thinking,
             },
             timeout_seconds=self.timeout_seconds,
             retries=self.retries,
@@ -484,7 +613,15 @@ def _build_distance_adapter(cfg: dict) -> DistanceAdapter:
         model = str(
             cfg.get("model") or os.environ.get("OBSTACLE_API_MODEL") or ""
         )
-        return QwenVLDistanceAdapter(url, key, model, **common)
+        return QwenVLDistanceAdapter(
+            url,
+            key,
+            model,
+            enable_thinking=_as_bool(cfg.get("enable_thinking")) is not False,
+            image_min_pixels=int(cfg.get("image_min_pixels", 262144)),
+            image_max_pixels=int(cfg.get("image_max_pixels", 1048576)),
+            **common,
+        )
 
     raise ValueError("obstacle_code provider must be 'openai' or 'qwen'")
 
@@ -507,6 +644,8 @@ class _ObstacleNode(Node):
         self._stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._detect_count = 0
+        self._positive_count = 0
+        self._negative_count = 0
         self._failure_count = 0
         self._last_latency_ms: Optional[float] = None
         self.state = "idle"
@@ -576,9 +715,26 @@ class _ObstacleNode(Node):
 
     def _publish_result(self, result: dict):
         self._detect_count += 1
+        distance = float(result.get("pred_distance", 10.0))
+        is_positive = distance < self._adapter.decision_distance_m
+        if is_positive:
+            self._positive_count += 1
+        else:
+            self._negative_count += 1
+        log.info(
+            "[obstacle-remote] result distance=%.3fm positive=%s band=%s "
+            "confidence=%.3f totals=%d/%d failures=%d",
+            distance,
+            is_positive,
+            result.get("distance_band", "unknown"),
+            float(result.get("confidence", 0.0)),
+            self._positive_count,
+            self._negative_count,
+            self._failure_count,
+        )
         msg = String()
         msg.data = json.dumps({
-            "pred_distance": result.get("pred_distance", 10.0),
+            "pred_distance": distance,
         }, ensure_ascii=False)
         self._pub.publish(msg)
 
@@ -620,6 +776,8 @@ class ObstacleDistancePlugin:
                     "input": node._input_topic,
                     "output": node._output_topic,
                     "detect_count": node._detect_count,
+                    "positive_count": node._positive_count,
+                    "negative_count": node._negative_count,
                     "failure_count": node._failure_count,
                     "last_latency_ms": node._last_latency_ms,
                 }
@@ -709,3 +867,4 @@ class ObstacleDistancePlugin:
                 return {"status": "configured", "config": public_cfg}
 
         return None
+
