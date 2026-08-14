@@ -1,3 +1,4 @@
+
 mcp_port: 15720
 
 plugins:
@@ -88,6 +89,13 @@ plugins:
     no_obstacle_distance: 10.0
     request_timeout_seconds: 30
     request_retries: 1
+    # qwen3.5-27b is a native vision-language model. Keep reasoning explicit;
+    # obstacle_code.py falls back automatically if a third-party gateway rejects it.
+    enable_thinking: true
+    # Preserve small/low obstacles better than Qwen3.5's roughly 0.65 MP default
+    # while keeping request cost and latency bounded.
+    image_min_pixels: 262144
+    image_max_pixels: 1048576
     model_path: "/models/obstacle"
     # 8 GB Jetson runs 10 inference containers concurrently. Keep the
     # controllable CUDA/TensorRT budget below 450 MiB per container so CUDA
